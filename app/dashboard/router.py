@@ -104,7 +104,14 @@ async def _ws_auth(websocket: WebSocket, token: str | None = Query(default=None)
     """
     Validate a JWT passed as ?token= query param for WebSocket connections.
     Returns None and closes the socket on failure.
+
+    Starlette requires the socket to be accepted before websocket.close()
+    can send a proper close frame; otherwise it returns HTTP 403 on the
+    WebSocket handshake. So we accept() first, then validate, then close()
+    if the token is invalid.
     """
+    await websocket.accept()
+
     if not token:
         await websocket.close(code=4001)
         return None
@@ -179,12 +186,15 @@ async def robot_ws(
 
     Requirements: 3.1 (heartbeat), 3.4 (mode), 3.5 (pose), 3.6 (safety)
     """
+    # Accept first so auth failures send a proper WS close frame instead
+    # of an HTTP 403 handshake rejection.
+    await websocket.accept()
+
     # Authenticate robot via query param api_key (WS can't set headers easily)
     if not api_key or api_key != settings.ROBOT_API_KEY:
         await websocket.close(code=4001)
         return
 
-    await websocket.accept()
     logger.info("Robot connected via WebSocket")
 
     # Fetch the robot record (we assume single robot)
@@ -196,7 +206,7 @@ async def robot_ws(
 
     if robot is None:
         await websocket.close(code=4004)
-        return
+        return  # noqa: F841
 
     robot_id = str(robot.id)
 

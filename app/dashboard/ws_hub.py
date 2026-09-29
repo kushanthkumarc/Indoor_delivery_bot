@@ -40,10 +40,12 @@ class DashboardWSHub:
 
     async def connect(self, websocket: WebSocket) -> None:
         """
-        Accept a new WebSocket connection and immediately push the current
+        Register a new WebSocket connection and immediately push the current
         robot state snapshot to it (Requirement 3.7).
+
+        Note: the socket must already be accepted by the caller — this
+        method only registers it with the hub and sends the snapshot.
         """
-        await websocket.accept()
         self._connections.add(websocket)
         logger.info("Dashboard client connected. Total: %d", len(self._connections))
 

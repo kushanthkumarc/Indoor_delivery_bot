@@ -216,7 +216,7 @@ class GoalTracker:
             goal = self._goals.get(goal_id)
             return goal.status if goal else None
 
-    def get_active_goals(self) -> list[TrackedGoal]:
+    async def get_active_goals(self) -> list[TrackedGoal]:
         """Get all active (non-terminal) goals."""
         async with self._lock:
             return [
