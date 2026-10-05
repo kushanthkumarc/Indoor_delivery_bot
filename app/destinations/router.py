@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -194,7 +194,11 @@ async def update(
     return DestinationResponse.from_orm(destination)
 
 
-@router.delete("/{destination_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{destination_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
 async def delete(
     destination_id: str,
     db: Annotated[AsyncSession, Depends(get_db)],

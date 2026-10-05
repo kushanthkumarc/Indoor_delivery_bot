@@ -11,7 +11,7 @@ All routes require ADMIN JWT (Requirement 1.7).
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -175,7 +175,11 @@ async def update_user(
     return UserResponse.model_validate(user)
 
 
-@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/users/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
 async def delete_user(
     user_id: str,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -291,6 +295,7 @@ async def grant_robot_access(
 @router.delete(
     "/users/{user_id}/robots/{robot_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
     responses={404: {"description": "Access grant not found"}},
 )
 async def revoke_robot_access(

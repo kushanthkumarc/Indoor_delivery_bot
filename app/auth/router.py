@@ -373,7 +373,11 @@ async def refresh_token(
     return TokenResponse(access_token=new_access)
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
 async def logout(
     response: Response,
     db: Annotated[AsyncSession, Depends(get_db)],

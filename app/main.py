@@ -46,6 +46,13 @@ if settings.SIMULATION_MODE:
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    # 1. Run DB migrations first (idempotent — no-op if already at head).
+    #    This lets deploys (Render, Docker, etc.) work without a separate
+    #    release-phase alembic command.
+    import asyncio
+    from app.core.startup import run_in_thread
+    await asyncio.get_event_loop().run_in_executor(None, run_in_thread)
+
     await _seed_first_admin()
     # Sync safety state from DB (Requirement 7.1)
     from app.safety.manager import safety_manager
