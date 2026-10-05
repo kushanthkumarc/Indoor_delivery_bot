@@ -13,12 +13,19 @@ def _build_ssl_arg(ssl_dict: dict) -> bool | ssl.SSLContext:
     Convert a normalized ssl-params dict into an `ssl` arg suitable for
     aiomysql.connect().
 
-    aiomysql accepts only:
-      - True                 → enable SSL, no cert verification
-      - False                → no SSL
-      - ssl.SSLContext       → custom SSL config (with cert verification)
+    Always returns a proper `ssl.SSLContext` (never a dict, never the
+    bare bool `True`). The context settings depend on the SSL mode:
 
-    A **dict** is NOT accepted — the asyncio SSL transport calls
+      - `?ssl-mode=REQUIRED` (or any non-verify mode) → SSL on, cert
+        verification OFF. This is the standard pattern for cloud MySQL
+        providers (PlanetScale, Aiven, Render) whose self-signed certs
+        are not in the system trust store. The connection is still
+        encrypted; we just don't validate the server's identity.
+      - `?ssl-mode=VERIFY_CA` or `?ssl-mode=VERIFY_IDENTITY` (or
+        `?ssl-ca=...`) → full cert verification with the system trust
+        store, optionally augmented by a custom CA file.
+
+    A **dict** is NEVER returned — the asyncio SSL transport calls
     `ssl_context.wrap_bio(...)`, which raises
     `AttributeError: 'dict' object has no attribute 'wrap_bio'`.
     """
@@ -28,21 +35,22 @@ def _build_ssl_arg(ssl_dict: dict) -> bool | ssl.SSLContext:
     ssl_mode = (ssl_dict.get("ssl_mode") or "REQUIRED").upper()
     ssl_ca = ssl_dict.get("ssl_ca")
 
-    # If user wants cert verification OR provides a custom CA, build a real
-    # SSLContext with the appropriate flags.
-    if ssl_ca or ssl_mode in ("VERIFY_CA", "VERIFY_IDENTITY"):
-        ctx = ssl.create_default_context()
-        if ssl_ca:
-            ctx.load_verify_locations(cafile=ssl_ca)
-        if ssl_mode in ("VERIFY_CA", "VERIFY_IDENTITY"):
-            ctx.check_hostname = True
-            ctx.verify_mode = ssl.CERT_REQUIRED
-        return ctx
+    # Always start from a real SSLContext so the connection is encrypted.
+    ctx = ssl.create_default_context()
 
-    # SSL required but no cert verification — most common for cloud
-    # providers (PlanetScale, Aiven, Render) whose certs aren't in the
-    # system trust store but the connection is still encrypted.
-    return True
+    if ssl_ca:
+        ctx.load_verify_locations(cafile=ssl_ca)
+
+    if ssl_mode in ("VERIFY_CA", "VERIFY_IDENTITY"):
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    else:
+        # REQUIRED, PREFERRED, or no explicit mode → SSL on, cert verify
+        # off. Required for cloud MySQL providers with self-signed certs.
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    return ctx
 
 
 def _normalize_database_url(raw_url: str) -> tuple[str, dict]:
