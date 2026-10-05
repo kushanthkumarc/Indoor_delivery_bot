@@ -139,6 +139,12 @@ class User(Base):
         "Delivery", back_populates="requester", foreign_keys="Delivery.requester_id"
     )
     events: Mapped[list["Event"]] = relationship("Event", back_populates="user")
+    robot_access_grants: Mapped[list["UserRobotAccess"]] = relationship(
+        "UserRobotAccess",
+        back_populates="user",
+        foreign_keys="UserRobotAccess.user_id",
+        cascade="all, delete-orphan",
+    )
 
     __table_args__ = (Index("ix_users_email", "email"),)
 
@@ -190,6 +196,12 @@ class Robot(Base):
         "Delivery", back_populates="robot"
     )
     events: Mapped[list["Event"]] = relationship("Event", back_populates="robot")
+    user_access_grants: Mapped[list["UserRobotAccess"]] = relationship(
+        "UserRobotAccess",
+        back_populates="robot",
+        foreign_keys="UserRobotAccess.robot_id",
+        cascade="all, delete-orphan",
+    )
 
 
 class MappingSession(Base):
@@ -378,4 +390,56 @@ class Event(Base):
         Index("ix_events_severity", "severity"),
         Index("ix_events_type", "type"),
         Index("ix_events_created_at", "created_at"),
+    )
+
+
+class UserRobotAccess(Base):
+    """
+    Per-user robot-access grant.
+
+    A USER can only dispatch deliveries on a robot if a row exists here for
+    that (user_id, robot_id) pair. ADMIN bypasses this check (admin can act
+    on any robot).
+
+    A user may have access to multiple robots, and a robot may be granted to
+    multiple users. `granted_by` records which admin provisioned the access
+    (audit trail). Soft-deleting a user via DELETE /admin/users/:id cascades
+    and revokes all their robot access automatically.
+    """
+
+    __tablename__ = "user_robot_access"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        CHAR(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    robot_id: Mapped[uuid.UUID] = mapped_column(
+        CHAR(36),
+        ForeignKey("robots.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    granted_by: Mapped[uuid.UUID] = mapped_column(
+        CHAR(36),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship(
+        "User", back_populates="robot_access_grants", foreign_keys=[user_id]
+    )
+    robot: Mapped["Robot"] = relationship(
+        "Robot", back_populates="user_access_grants", foreign_keys=[robot_id]
+    )
+    granted_by_user: Mapped["User"] = relationship(
+        "User", foreign_keys=[granted_by]
+    )
+
+    __table_args__ = (
+        Index("ix_ura_user_id", "user_id"),
+        Index("ix_ura_robot_id", "robot_id"),
     )

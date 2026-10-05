@@ -26,11 +26,20 @@ from app.auth.service import (
     check_rate_limit,
     get_rate_limit_ttl,
     is_blacklisted,
+    register_user,
 )
 from app.core.config import settings
-from app.db.models import Event, EventSeverity, User, UserRole
+from app.db.models import (
+    Event,
+    EventSeverity,
+    Robot,
+    User,
+    UserRole,
+    UserRobotAccess,
+)
 from app.db.redis import get_redis
 from app.db.session import get_db
+from sqlalchemy import select
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -48,6 +57,12 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -61,6 +76,19 @@ class UserResponse(BaseModel):
     is_active: bool
 
     model_config = {"from_attributes": True}
+
+
+class RegisterResponse(BaseModel):
+    user: UserResponse
+    access_token: str
+    token_type: str = "bearer"
+
+
+class MyRobotResponse(BaseModel):
+    id: str
+    name: str
+    status: str
+    granted_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +209,112 @@ async def login(
     )
 
     return TokenResponse(access_token=access_token)
+
+
+@router.post(
+    "/register",
+    response_model=RegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        409: {"description": "Email already registered"},
+        429: {"description": "Too many registration attempts"},
+    },
+)
+async def register(
+    body: RegisterRequest,
+    request: Request,
+    response: Response,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis=Depends(get_redis),
+) -> RegisterResponse:
+    """
+    Public self-registration endpoint (ERP-style).
+
+    Bootstrap rule:
+      - If no active ADMIN exists yet, the new user is created as role=ADMIN.
+      - Otherwise the new user is created as role=USER (zero robot access).
+
+    Rate-limited to 5 attempts per 15 min per IP (same as login).
+    On success the response includes an access_token and the refresh_token
+    cookie is set so the caller is auto-logged-in.
+    """
+    ip = _client_ip(request)
+
+    allowed = await check_rate_limit(redis, ip)
+    if not allowed:
+        ttl = await get_rate_limit_ttl(redis, ip)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "RATE_LIMITED", "retry_after": ttl},
+        )
+
+    try:
+        user, became_admin = await register_user(db, body.email, body.password, body.name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "EMAIL_ALREADY_EXISTS", "message": str(exc)},
+        )
+
+    access_token = create_access_token(str(user.id), user.email, user.role.value)
+    refresh_token, _jti = create_refresh_token(str(user.id))
+    _set_refresh_cookie(response, refresh_token)
+
+    await _log_event(
+        db,
+        "auth.bootstrap_admin" if became_admin else "auth.register",
+        EventSeverity.INFO,
+        user_id=str(user.id),
+        payload={"ip": ip, "role": user.role.value},
+    )
+
+    return RegisterResponse(
+        user=UserResponse.model_validate(user),
+        access_token=access_token,
+    )
+
+
+@router.get("/me/robots", response_model=list[MyRobotResponse])
+async def my_robots(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: User = Depends(get_current_user),
+) -> list[MyRobotResponse]:
+    """
+    Return the robots the current user has been granted access to.
+
+    ADMIN users bypass the join table (they can act on any robot), so this
+    endpoint returns ALL robots when the caller is ADMIN.
+    """
+    if current_user.role == UserRole.ADMIN:
+        result = await db.execute(select(Robot).order_by(Robot.created_at))
+        robots = result.scalars().all()
+        return [
+            MyRobotResponse(
+                id=str(r.id),
+                name=r.name,
+                status=r.status.value,
+                granted_at=r.created_at.isoformat() if r.created_at else "",
+            )
+            for r in robots
+        ]
+
+    stmt = (
+        select(Robot, UserRobotAccess.granted_at)
+        .join(UserRobotAccess, UserRobotAccess.robot_id == Robot.id)
+        .where(UserRobotAccess.user_id == str(current_user.id))
+        .order_by(UserRobotAccess.granted_at)
+    )
+    result = await db.execute(stmt)
+    rows = result.all()
+    return [
+        MyRobotResponse(
+            id=str(robot.id),
+            name=robot.name,
+            status=robot.status.value,
+            granted_at=granted_at.isoformat() if granted_at else "",
+        )
+        for robot, granted_at in rows
+    ]
 
 
 @router.post("/refresh", response_model=TokenResponse)

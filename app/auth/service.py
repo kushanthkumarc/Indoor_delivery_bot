@@ -6,10 +6,10 @@ Requirements: 1.3, 1.4, 1.5, 1.8, 1.14
 
 import bcrypt
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import User
+from app.db.models import Event, EventSeverity, User, UserRole
 
 # Redis key prefixes
 _BLACKLIST_PREFIX = "auth:blacklist:"
@@ -97,3 +97,65 @@ async def get_rate_limit_ttl(redis: Redis, ip: str) -> int:
     key = f"{_RATE_LIMIT_PREFIX}{ip}"
     ttl = await redis.ttl(key)
     return max(ttl, 0)
+
+
+# ---------------------------------------------------------------------------
+# Self-registration  (ERP-style first-admin bootstrap)
+# ---------------------------------------------------------------------------
+
+
+async def count_active_admins(db: AsyncSession) -> int:
+    """Return the count of active ADMIN-role users in the database."""
+    result = await db.execute(
+        select(func.count()).select_from(User).where(
+            User.role == UserRole.ADMIN, User.is_active.is_(True)
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def register_user(
+    db: AsyncSession,
+    email: str,
+    password: str,
+    name: str,
+) -> tuple[User, bool]:
+    """
+    Create a new user account via self-registration.
+
+    Bootstrap rule:
+      - If no active ADMIN exists yet, the new user is created as role=ADMIN.
+      - Otherwise the new user is created as role=USER.
+
+    Returns (user, became_admin) where `became_admin` is True only if the new
+    user was the first-ever active admin (this is mainly for logging).
+
+    Raises ValueError if the email is already registered.
+    """
+    existing = await db.execute(select(User).where(User.email == email))
+    if existing.scalar_one_or_none() is not None:
+        raise ValueError("email already registered")
+
+    became_admin = (await count_active_admins(db)) == 0
+    role = UserRole.ADMIN if became_admin else UserRole.USER
+
+    user = User(
+        email=email,
+        password_hash=hash_password(password),
+        name=name,
+        role=role,
+        is_active=True,
+    )
+    db.add(user)
+    await db.flush()
+
+    event = Event(
+        type="auth.bootstrap_admin" if became_admin else "auth.register",
+        severity=EventSeverity.INFO,
+        user_id=str(user.id),
+        payload_json={"email": email, "role": role.value},
+    )
+    db.add(event)
+    await db.flush()
+
+    return user, became_admin

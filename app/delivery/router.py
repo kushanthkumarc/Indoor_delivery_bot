@@ -13,7 +13,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.auth.dependencies import get_current_user, require_admin
-from app.db.models import ControlMode, Delivery, DeliveryStatus, Robot, RobotStatus, User, UserRole
+from app.db.models import (
+    ControlMode,
+    Delivery,
+    DeliveryStatus,
+    Robot,
+    RobotStatus,
+    User,
+    UserRole,
+    UserRobotAccess,
+)
 from app.db.session import AsyncSessionLocal
 from app.delivery.state_machine import InvalidTransitionError
 
@@ -45,13 +54,27 @@ async def create_delivery(
         robot = res.scalar_one_or_none()
         if not robot:
              raise HTTPException(status_code=404, detail="Robot not found")
-             
+
+        # Per-user robot access check (ADMIN bypasses)
+        if current_user.role != UserRole.ADMIN:
+            access_res = await db.execute(
+                select(UserRobotAccess).where(
+                    UserRobotAccess.user_id == str(current_user.id),
+                    UserRobotAccess.robot_id == request.robot_id,
+                )
+            )
+            if access_res.scalar_one_or_none() is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={"error": "ROBOT_ACCESS_DENIED"},
+                )
+
         if robot.control_mode != ControlMode.AUTONOMOUS:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"error": "ROBOT_NOT_AUTONOMOUS"}
             )
-            
+
         if robot.status != RobotStatus.ONLINE:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

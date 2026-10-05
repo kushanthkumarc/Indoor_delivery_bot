@@ -280,6 +280,136 @@ async def main() -> int:
         r = await c.post("/sim/inject-fault", json={"fault": "SLAM_LOST"}, headers=H(admin_access))
         record("simulation", "POST /sim/inject-fault (TODO)", "501", r.status_code)
 
+        # ---------------------------------------------------------------
+        # Self-registration (ERP-style) + Robot-access (new in this session)
+        # ---------------------------------------------------------------
+        # Flush rate-limit counters so the new endpoint tests start clean.
+        # (The previous tests' login attempts may have filled the bucket.)
+        try:
+            import subprocess as _sp
+            _sp.run(["docker", "exec", "robot_redis", "redis-cli", "FLUSHALL"],
+                     capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+        # We use a unique email so reruns do not collide with prior runs.
+        import uuid as _u
+        new_user_email = f"e2e_newuser_{_u.uuid4().hex[:8]}@example.com"
+        new_user_password = "E2eNewUser!2345"
+
+        r = await c.post(
+            "/auth/register",
+            json={"email": new_user_email, "password": new_user_password, "name": "E2E New User"},
+        )
+        record("auth", "POST /auth/register (subsequent = USER)", "201", r.status_code,
+               "role=" + r.json().get("user", {}).get("role", "?") if r.status_code == 201 else r.text[:120])
+        new_user_token = r.json().get("access_token") if r.status_code == 201 else None
+        new_user_id = r.json().get("user", {}).get("id") if r.status_code == 201 else None
+
+        # Duplicate email
+        r = await c.post(
+            "/auth/register",
+            json={"email": new_user_email, "password": new_user_password, "name": "Dup"},
+        )
+        record("auth", "POST /auth/register (duplicate) -> 409", "409", r.status_code, str(r.json().get("detail", "")))
+
+        # New user can login
+        r = await c.post("/auth/login", json={"email": new_user_email, "password": new_user_password})
+        record("auth", "login newly-registered USER", "200", r.status_code)
+        new_user_login_token = r.json().get("access_token") if r.status_code == 200 else None
+
+        # /auth/me for new user
+        if new_user_login_token:
+            r = await c.get("/auth/me", headers=H(new_user_login_token))
+            record("auth", "GET /auth/me (new USER)", "200", r.status_code, "role=" + r.json().get("role", "?"))
+
+        # /auth/me/robots is empty for new user
+        if new_user_login_token:
+            r = await c.get("/auth/me/robots", headers=H(new_user_login_token))
+            record("auth", "GET /auth/me/robots (no access yet)", "200", r.status_code, f"count={len(r.json())}")
+
+        # Admin lists a user's robot access (initially empty)
+        if new_user_id:
+            r = await c.get(f"/admin/users/{new_user_id}/robots", headers=H(admin_access))
+            record("admin", "GET /admin/users/{id}/robots (empty)", "200", r.status_code, f"count={len(r.json())}")
+
+        # Admin grants the new user access to the robot
+        if new_user_id and robot_id:
+            r = await c.post(f"/admin/users/{new_user_id}/robots/{robot_id}", headers=H(admin_access))
+            record("admin", "POST /admin/users/{id}/robots/{rid} grant", "201", r.status_code,
+                   "robot_id=" + r.json().get("robot_id", "?")[:8] if r.status_code == 201 else r.text[:120])
+
+            # Duplicate grant -> 409
+            r = await c.post(f"/admin/users/{new_user_id}/robots/{robot_id}", headers=H(admin_access))
+            record("admin", "POST /admin/users/{id}/robots/{rid} duplicate -> 409", "409", r.status_code, str(r.json().get("detail", "")))
+
+            # List now shows 1 robot
+            r = await c.get(f"/admin/users/{new_user_id}/robots", headers=H(admin_access))
+            record("admin", "GET /admin/users/{id}/robots (after grant)", "200", r.status_code, f"count={len(r.json())}")
+
+        # /auth/me/robots now contains the granted robot
+        if new_user_login_token:
+            r = await c.get("/auth/me/robots", headers=H(new_user_login_token))
+            record("auth", "GET /auth/me/robots (after grant)", "200", r.status_code, f"count={len(r.json())}")
+
+        # USER (no access) tries to book a delivery on the robot — needs to fail.
+        # We create a separate user with no access for this check.
+        no_access_email = f"e2e_noaccess_{_u.uuid4().hex[:8]}@example.com"
+        r = await c.post(
+            "/auth/register",
+            json={"email": no_access_email, "password": "NoAccess!2345", "name": "No Access User"},
+        )
+        no_access_token = r.json().get("access_token") if r.status_code == 201 else None
+        no_access_id = r.json().get("user", {}).get("id") if r.status_code == 201 else None
+
+        # First, ensure robot is autonomous+online, then try as no-access USER
+        await set_robot_mode(robot_id, "ONLINE", "AUTONOMOUS")
+        if no_access_token and home_id:
+            r = await c.post(
+                "/deliveries",
+                json={"robot_id": robot_id, "destination_id": home_id},
+                headers=H(no_access_token),
+            )
+            record("delivery", "POST /deliveries (USER w/o access) -> 403", "403", r.status_code, str(r.json().get("detail", "")))
+
+        # Now grant the no-access user access to the robot
+        if no_access_id and robot_id:
+            r = await c.post(f"/admin/users/{no_access_id}/robots/{robot_id}", headers=H(admin_access))
+            record("admin", "Grant no-access user to robot", "201", r.status_code)
+
+        # USER with access can book
+        if no_access_token and home_id:
+            r = await c.post(
+                "/deliveries",
+                json={"robot_id": robot_id, "destination_id": home_id},
+                headers=H(no_access_token),
+            )
+            # 201 if robot is online+autonomous+idle; 409 if busy; both are valid
+            record("delivery", "POST /deliveries (USER w/ access)", "201|409", str(r.status_code),
+                   "ok" if r.status_code in (201, 409) else r.text[:120])
+
+        # Revoke access
+        if no_access_id and robot_id:
+            r = await c.delete(f"/admin/users/{no_access_id}/robots/{robot_id}", headers=H(admin_access))
+            record("admin", "DELETE /admin/users/{id}/robots/{rid} revoke", "204", r.status_code)
+
+            # Revoke again -> 404
+            r = await c.delete(f"/admin/users/{no_access_id}/robots/{robot_id}", headers=H(admin_access))
+            record("admin", "DELETE /admin/users/{id}/robots/{rid} (already revoked) -> 404", "404", r.status_code)
+
+        # ADMIN bypass: even without grant row, admin can dispatch
+        # (use a fresh user that has no access row, to prove admin bypass)
+        # Actually we already have a fresh admin scenario — just re-check admin can book
+        if home_id:
+            await set_robot_mode(robot_id, "ONLINE", "AUTONOMOUS")
+            r = await c.post(
+                "/deliveries",
+                json={"robot_id": robot_id, "destination_id": home_id},
+                headers=H(admin_access),
+            )
+            record("delivery", "POST /deliveries (ADMIN bypasses access)", "201|409", str(r.status_code),
+                   "ok" if r.status_code in (201, 409) else r.text[:120])
+
     return _summary()
 
 
