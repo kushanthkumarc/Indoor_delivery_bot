@@ -1,3 +1,4 @@
+import ssl
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.engine.url import make_url
@@ -5,6 +6,43 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
+
+
+def _build_ssl_arg(ssl_dict: dict) -> bool | ssl.SSLContext:
+    """
+    Convert a normalized ssl-params dict into an `ssl` arg suitable for
+    aiomysql.connect().
+
+    aiomysql accepts only:
+      - True                 → enable SSL, no cert verification
+      - False                → no SSL
+      - ssl.SSLContext       → custom SSL config (with cert verification)
+
+    A **dict** is NOT accepted — the asyncio SSL transport calls
+    `ssl_context.wrap_bio(...)`, which raises
+    `AttributeError: 'dict' object has no attribute 'wrap_bio'`.
+    """
+    if not ssl_dict:
+        return False
+
+    ssl_mode = (ssl_dict.get("ssl_mode") or "REQUIRED").upper()
+    ssl_ca = ssl_dict.get("ssl_ca")
+
+    # If user wants cert verification OR provides a custom CA, build a real
+    # SSLContext with the appropriate flags.
+    if ssl_ca or ssl_mode in ("VERIFY_CA", "VERIFY_IDENTITY"):
+        ctx = ssl.create_default_context()
+        if ssl_ca:
+            ctx.load_verify_locations(cafile=ssl_ca)
+        if ssl_mode in ("VERIFY_CA", "VERIFY_IDENTITY"):
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+
+    # SSL required but no cert verification — most common for cloud
+    # providers (PlanetScale, Aiven, Render) whose certs aren't in the
+    # system trust store but the connection is still encrypted.
+    return True
 
 
 def _normalize_database_url(raw_url: str) -> tuple[str, dict]:
@@ -15,13 +53,13 @@ def _normalize_database_url(raw_url: str) -> tuple[str, dict]:
     as query-string keys like `?ssl-mode=REQUIRED` or `?ssl-ca=/path/to/ca`.
     SQLAlchemy's MySQL/aiomysql dialect forwards every query-string key as
     a `**kwarg` to `aiomysql.connect()`, which does NOT accept `ssl-mode`
-    (only `ssl` as a dict).
+    (only `ssl` as a bool or `ssl.SSLContext`).
 
     This helper:
       1. Parses the URL with `sqlalchemy.engine.url.make_url`.
       2. Pops any `ssl-*` / `ssl_*` keys from the query.
       3. Returns a tuple of (clean_url, connect_args) where `connect_args`
-         contains an aiomysql-compatible `{"ssl": {...}}` dict.
+         contains `{"ssl": <bool|SSLContext>}` — never a dict.
 
     For URLs that already work locally (no SSL params), the function
     returns the URL unchanged and `connect_args={}`.
@@ -50,7 +88,9 @@ def _normalize_database_url(raw_url: str) -> tuple[str, dict]:
 
     connect_args: dict = {}
     if ssl_dict:
-        connect_args["ssl"] = ssl_dict
+        ssl_arg = _build_ssl_arg(ssl_dict)
+        if ssl_arg is not False:
+            connect_args["ssl"] = ssl_arg
     return clean_url, connect_args
 
 

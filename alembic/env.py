@@ -15,7 +15,11 @@ if config.config_file_name is not None:
 
 # Import Base and all models so Alembic can detect schema changes
 from app.core.config import settings  # noqa: E402
-from app.db.session import Base, _normalize_database_url  # noqa: E402
+from app.db.session import (  # noqa: E402
+    Base,
+    _build_ssl_arg,
+    _normalize_database_url,
+)
 
 # Models must be imported for autogenerate to pick them up.
 from app.db import models as _models  # noqa: F401
@@ -57,9 +61,19 @@ async def run_async_migrations() -> None:
     """Run migrations using an async engine."""
     section = config.get_section(config.config_ini_section, {})
     # Re-inject connect_args (set above) into the engine config so
-    # aiomysql's connect() gets them as **kwargs.
+    # aiomysql's connect() gets them as **kwargs. We rebuild the SSL
+    # arg via `_build_ssl_arg` so we never pass a dict to the asyncio
+    # SSL transport (which breaks with `'dict' has no attribute 'wrap_bio'`).
     if _connect_args:
-        section["connect_args"] = _connect_args
+        ssl_arg = _connect_args.get("ssl")
+        if isinstance(ssl_arg, dict):
+            rebuilt = _build_ssl_arg(ssl_arg)
+            if rebuilt is False:
+                _connect_args.pop("ssl", None)
+            else:
+                _connect_args["ssl"] = rebuilt
+        if _connect_args:
+            section["connect_args"] = _connect_args
     connectable = async_engine_from_config(
         section,
         prefix="sqlalchemy.",
