@@ -15,15 +15,23 @@ if config.config_file_name is not None:
 
 # Import Base and all models so Alembic can detect schema changes
 from app.core.config import settings  # noqa: E402
-from app.db.session import Base  # noqa: E402
+from app.db.session import Base, _normalize_database_url  # noqa: E402
 
 # Models must be imported for autogenerate to pick them up.
 from app.db import models as _models  # noqa: F401
 
 target_metadata = Base.metadata
 
-# Override the URL from the environment (ignores the blank value in alembic.ini)
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# Override the URL from the environment (ignores the blank value in alembic.ini).
+# Strip PlanetScale / Aiven-style `?ssl-mode=…` query params and re-emit the
+# cleaned URL plus the corresponding connect_args. SQLAlchemy's aiomysql
+# dialect forwards query-string keys as kwargs to `aiomysql.connect()`,
+# which doesn't accept `ssl-mode` — so we must drop it here.
+_clean_url, _connect_args = _normalize_database_url(settings.DATABASE_URL)
+config.set_main_option("sqlalchemy.url", _clean_url)
+# Persist the connect_args so the async engine picks them up.
+for _k, _v in _connect_args.items():
+    config.set_main_option(f"sqlalchemy.{_k}", str(_v))
 
 
 def run_migrations_offline() -> None:
@@ -47,8 +55,13 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_async_migrations() -> None:
     """Run migrations using an async engine."""
+    section = config.get_section(config.config_ini_section, {})
+    # Re-inject connect_args (set above) into the engine config so
+    # aiomysql's connect() gets them as **kwargs.
+    if _connect_args:
+        section["connect_args"] = _connect_args
     connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        section,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
