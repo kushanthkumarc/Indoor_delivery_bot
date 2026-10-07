@@ -41,12 +41,16 @@ def _build_ssl_arg(ssl_dict: dict) -> bool | ssl.SSLContext:
     if ssl_ca:
         ctx.load_verify_locations(cafile=ssl_ca)
 
-    if ssl_mode in ("VERIFY_CA", "VERIFY_IDENTITY"):
+    # Cert verification is ON when the user either asks for it explicitly
+    # (ssl-mode=VERIFY_CA / VERIFY_IDENTITY) OR provides a custom CA file.
+    # It's OFF when only ssl-mode=REQUIRED (cloud MySQL with self-signed
+    # certs that aren't in the system trust store).
+    wants_verify = ssl_mode in ("VERIFY_CA", "VERIFY_IDENTITY")
+    has_ca = bool(ssl_ca)
+    if wants_verify or has_ca:
         ctx.check_hostname = True
         ctx.verify_mode = ssl.CERT_REQUIRED
     else:
-        # REQUIRED, PREFERRED, or no explicit mode → SSL on, cert verify
-        # off. Required for cloud MySQL providers with self-signed certs.
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 

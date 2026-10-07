@@ -157,10 +157,21 @@ async def login(
     Authenticate with email + password.
     Returns an access token and sets a refresh token cookie.
     Rate-limited to 5 attempts per 15 min per IP (Requirement 1.8).
+    Fails closed (503) if the rate-limiter (Redis) is unreachable.
     """
     ip = _client_ip(request)
 
-    allowed = await check_rate_limit(redis, ip)
+    try:
+        allowed = await check_rate_limit(redis, ip)
+    except Exception:
+        # Fail closed: don't allow login when rate-limiting is offline.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "RATE_LIMITER_UNAVAILABLE",
+                "message": "Authentication temporarily unavailable. Please retry shortly.",
+            },
+        )
     if not allowed:
         ttl = await get_rate_limit_ttl(redis, ip)
         raise HTTPException(
@@ -235,12 +246,23 @@ async def register(
       - Otherwise the new user is created as role=USER (zero robot access).
 
     Rate-limited to 5 attempts per 15 min per IP (same as login).
+    Fails closed (503) if the rate-limiter (Redis) is unreachable.
     On success the response includes an access_token and the refresh_token
     cookie is set so the caller is auto-logged-in.
     """
     ip = _client_ip(request)
 
-    allowed = await check_rate_limit(redis, ip)
+    try:
+        allowed = await check_rate_limit(redis, ip)
+    except Exception:
+        # Fail closed: don't allow registration when rate-limiting is offline.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "RATE_LIMITER_UNAVAILABLE",
+                "message": "Authentication temporarily unavailable. Please retry shortly.",
+            },
+        )
     if not allowed:
         ttl = await get_rate_limit_ttl(redis, ip)
         raise HTTPException(

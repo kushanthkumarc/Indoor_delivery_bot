@@ -5,6 +5,7 @@ Requirements: 1.3, 1.4, 1.5, 1.8, 1.14
 """
 
 import bcrypt
+import redis.asyncio as redis_async
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,9 +85,31 @@ async def check_rate_limit(redis: Redis, ip: str) -> bool:
     """
     Return True if the IP is allowed to attempt login (under the limit).
     Increment the attempt counter; set expiry on first attempt.
+
+    Raises categorized errors so the caller can distinguish:
+      - AuthenticationError: bad password in env (REDIS_URL credentials)
+      - ConnectionError / TimeoutError: network/TLS/protocol issue
+        (e.g. `redis://` URL where provider requires `rediss://`)
     """
     key = f"{_RATE_LIMIT_PREFIX}{ip}"
-    count = await redis.incr(key)
+    try:
+        count = await redis.incr(key)
+    except redis_async.exceptions.AuthenticationError:
+        logger.error(
+            "Redis AUTH failed. Verify REDIS_URL credentials "
+            "(user:password@host:port). For cloud providers like Upstash, "
+            "the URL must start with rediss:// (TLS), not redis://."
+        )
+        raise
+    except (redis_async.exceptions.ConnectionError, redis_async.exceptions.TimeoutError) as e:
+        logger.error(
+            "Redis unreachable (%s: %s). Common causes: "
+            "(1) REDIS_URL uses redis:// but provider requires rediss:// (TLS); "
+            "(2) wrong host/port; (3) firewall blocking outbound to Redis; "
+            "(4) idle connection drop on the server side.",
+            type(e).__name__, e,
+        )
+        raise
     if count == 1:
         await redis.expire(key, _RATE_LIMIT_WINDOW_S)
     return count <= _MAX_LOGIN_ATTEMPTS
