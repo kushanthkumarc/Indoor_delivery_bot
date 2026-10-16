@@ -13,32 +13,89 @@ Requirements: 3.3, 3.4, 3.5, 3.6
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Any
+import secrets
+import asyncio
+import json
+import time
+from datetime import datetime, timezone
+import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import get_current_user, require_role
-from app.auth.robot_auth import validate_robot_api_key
+from app.auth.dependencies import AuthenticatedSession, require_role, require_session_role
+from app.auth.service import is_session_revoked
+from app.auth.robot_auth import authenticate_robot_credentials
 from app.core.config import settings
 from app.db.models import (
-    ControlMode,
     Robot,
-    SafetyState,
     User,
     UserRole,
 )
 from app.db.session import get_db
+from app.db.redis import get_redis
 from app.dashboard.service import RobotStatusService, status_service
 from app.dashboard.ws_hub import DashboardWSHub, hub
+from app.gateway.protocol import MessageOrderGuard, PROTOCOL_VERSION, TelemetryPayload, parse_envelope
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["dashboard"])
+_gateway_order_guard = MessageOrderGuard()
 
 _admin_dep = Depends(require_role(UserRole.ADMIN))
+_admin_session_dep = Depends(require_session_role(UserRole.ADMIN))
+_DASHBOARD_TICKET_PREFIX = "dashboard-ws-ticket:"
+_DASHBOARD_TICKET_TTL_S = 30
+_ISSUE_DASHBOARD_TICKET_LUA = (
+    "if redis.call('EXISTS',KEYS[1]) == 1 then return -1 end; "
+    "return redis.call('SET',KEYS[2],ARGV[1],'EX',ARGV[2],'NX') and 1 or 0"
+)
+_REDEEM_DASHBOARD_TICKET_LUA = (
+    "local value=redis.call('GET',KEYS[1]); "
+    "if not value then return nil end; "
+    "redis.call('DEL',KEYS[1]); "
+    "local data=cjson.decode(value); "
+    "if redis.call('EXISTS','auth:session-revoked:'..data.session_id) == 1 then return nil end; "
+    "return value"
+)
+
+
+@router.post("/dashboard/ws-ticket")
+async def create_dashboard_ws_ticket(
+    session: AuthenticatedSession = _admin_session_dep,
+    redis=Depends(get_redis),
+) -> dict[str, str | int]:
+    """Mint a short-lived one-use ticket for browser WebSocket authentication."""
+    remaining = session.expires_at - int(time.time())
+    if remaining <= 0:
+        raise HTTPException(status_code=401, detail={"error": "TOKEN_EXPIRED"})
+    ttl = min(_DASHBOARD_TICKET_TTL_S, remaining)
+    ticket = secrets.token_urlsafe(32)
+    value = json.dumps({
+        "user_id": str(session.user.id),
+        "session_id": session.session_id,
+        "expires_at": session.expires_at,
+    })
+    try:
+        created = await redis.eval(
+            _ISSUE_DASHBOARD_TICKET_LUA,
+            2,
+            f"auth:session-revoked:{session.session_id}",
+            f"{_DASHBOARD_TICKET_PREFIX}{ticket}",
+            value,
+            ttl,
+        )
+    except Exception:
+        raise HTTPException(status_code=503, detail={"error": "AUTH_UNAVAILABLE"}) from None
+    if created == -1:
+        raise HTTPException(status_code=401, detail={"error": "SESSION_REVOKED"})
+    if created != 1:
+        raise HTTPException(status_code=503, detail={"error": "AUTH_UNAVAILABLE"})
+    return {"ticket": ticket, "expires_in": ttl}
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +113,7 @@ class RobotStatusResponse(BaseModel):
     battery_level: float | None
     last_seen: str | None
     firmware_version: str | None
+    connection_state: str = "OFFLINE"
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +150,7 @@ async def get_robot_status(
         battery_level=robot.battery_level,
         last_seen=robot.last_seen.isoformat() if robot.last_seen else None,
         firmware_version=robot.firmware_version,
+        connection_state=status_service.connection_freshness(str(robot.id), robot.last_seen),
     )
 
 
@@ -100,9 +159,9 @@ async def get_robot_status(
 # ---------------------------------------------------------------------------
 
 
-async def _ws_auth(websocket: WebSocket, token: str | None = Query(default=None)) -> User | None:
+async def _ws_auth(websocket: WebSocket, ticket: str | None = None) -> AuthenticatedSession | None:
     """
-    Validate a JWT passed as ?token= query param for WebSocket connections.
+    Validate a short-lived, one-use Redis ticket (never a long-lived JWT).
     Returns None and closes the socket on failure.
 
     Starlette requires the socket to be accepted before websocket.close()
@@ -112,56 +171,82 @@ async def _ws_auth(websocket: WebSocket, token: str | None = Query(default=None)
     """
     await websocket.accept()
 
-    if not token:
+    if not ticket or len(ticket) > 128:
         await websocket.close(code=4001)
         return None
-
-    import jwt as _jwt
-    from app.auth.jwt import decode_token
     from app.db.session import AsyncSessionLocal
 
     try:
-        payload = decode_token(token)
-    except _jwt.InvalidTokenError:
-        await websocket.close(code=4001)
+        redis = await get_redis()
+        ticket_value = await redis.eval(
+            _REDEEM_DASHBOARD_TICKET_LUA,
+            1,
+            f"{_DASHBOARD_TICKET_PREFIX}{ticket}",
+        )
+    except Exception:
+        await websocket.close(code=1013)
         return None
-
-    if payload.get("type") != "access":
-        await websocket.close(code=4001)
-        return None
-
-    if payload.get("role") != UserRole.ADMIN.value:
+    if not ticket_value:
         await websocket.close(code=4003)
         return None
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(User).where(User.id == payload.get("sub")))
-        user = result.scalar_one_or_none()
-        if user is None or not user.is_active or user.role != UserRole.ADMIN:
-            await websocket.close(code=4003)
-            return None
+    try:
+        ticket_data = json.loads(ticket_value)
+        user_id = ticket_data["user_id"]
+        session_id = ticket_data["session_id"]
+        expires_at = int(ticket_data["expires_at"])
+    except (ValueError, TypeError, KeyError):
+        await websocket.close(code=4003)
+        return None
+    if expires_at <= int(time.time()):
+        await websocket.close(code=4001)
+        return None
 
-    return user
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+    except Exception as exc:
+        logger.warning("Dashboard WebSocket user lookup failed (%s)", type(exc).__name__)
+        await websocket.close(code=1013)
+        return None
+    if user is None or not user.is_active or user.role != UserRole.ADMIN:
+        await websocket.close(code=4003)
+        return None
+
+    return AuthenticatedSession(user=user, session_id=session_id, expires_at=expires_at)
 
 
 @router.websocket("/ws/dashboard")
-async def dashboard_ws(websocket: WebSocket, token: str | None = Query(default=None)) -> None:
+async def dashboard_ws(websocket: WebSocket, ticket: str | None = Query(default=None)) -> None:
     """
     WebSocket endpoint for ADMIN dashboard clients.
 
     On connect: sends current robot state snapshot (Req 3.7).
     Keeps connection open and broadcasts all robot events.
     """
-    user = await _ws_auth(websocket, token)
-    if user is None:
+    session = await _ws_auth(websocket, ticket)
+    if session is None:
         return
 
     await hub.connect(websocket)
     try:
         while True:
-            # Keep the connection alive; dashboard clients are read-only listeners.
-            # Any message from the client is discarded (UI pings etc.).
-            await websocket.receive_text()
+            # Periodically recheck the Redis session marker. This bounds logout
+            # termination delay without claiming instantaneous cross-instance closure.
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                if session.expires_at <= int(time.time()) or await is_session_revoked(
+                    await get_redis(), session.session_id
+                ):
+                    await websocket.close(code=4001)
+                    break
+            except Exception:
+                await websocket.close(code=1013)
+                break
     except WebSocketDisconnect:
         pass
     finally:
@@ -169,110 +254,133 @@ async def dashboard_ws(websocket: WebSocket, token: str | None = Query(default=N
 
 
 # ---------------------------------------------------------------------------
-# WebSocket — WS /ws/robot  (robot → backend telemetry channel)
+# WebSocket — WS /ws/robot (authenticated versioned gateway protocol)
 # ---------------------------------------------------------------------------
 
 
 @router.websocket("/ws/robot")
 async def robot_ws(
     websocket: WebSocket,
-    api_key: str | None = Query(default=None, alias="api_key"),
 ) -> None:
     """
-    Inbound WebSocket for the robot to push telemetry.
-
-    Authenticated via X-Robot-API-Key or ?api_key= query parameter.
-    Handles: heartbeat, pose_update, mode_change, safety_update.
-
-    Requirements: 3.1 (heartbeat), 3.4 (mode), 3.5 (pose), 3.6 (safety)
+    Credentials are supplied in X-Robot-ID and X-Robot-API-Key headers. The
+    first authenticated protocol message must be a v1 hello. Credentials in
+    query parameters are explicitly rejected.
     """
-    # Accept first so auth failures send a proper WS close frame instead
-    # of an HTTP 403 handshake rejection.
-    await websocket.accept()
-
-    # Authenticate robot via query param api_key (WS can't set headers easily)
-    if not api_key or api_key != settings.ROBOT_API_KEY:
-        await websocket.close(code=4001)
+    if "api_key" in websocket.query_params or "token" in websocket.query_params:
+        await websocket.close(code=4401)
+        return
+    robot_id = websocket.headers.get("x-robot-id")
+    api_key = websocket.headers.get("x-robot-api-key")
+    if not robot_id or not api_key:
+        await websocket.close(code=4401)
         return
 
-    logger.info("Robot connected via WebSocket")
-
-    # Fetch the robot record (we assume single robot)
     from app.db.session import AsyncSessionLocal
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Robot).limit(1))
-        robot = result.scalar_one_or_none()
-
+    try:
+        async with AsyncSessionLocal() as db:
+            robot = await authenticate_robot_credentials(robot_id, api_key, db)
+    except Exception as exc:
+        logger.warning("Robot gateway authentication lookup failed (%s)", type(exc).__name__)
+        await websocket.close(code=1013)
+        return
     if robot is None:
-        await websocket.close(code=4004)
-        return  # noqa: F841
-
+        # Do not reveal whether the ID or credential was invalid.
+        await websocket.close(code=4401)
+        return
     robot_id = str(robot.id)
+    await websocket.accept()
+    connected = False
+    connection_id = str(uuid.uuid4())
 
     try:
+        try:
+            raw = await websocket.receive_text()
+            hello = parse_envelope(raw, max_bytes=settings.ROBOT_GATEWAY_MAX_MESSAGE_BYTES)
+        except ValueError as exc:
+            detail = "UNSUPPORTED_VERSION" if "version" in str(exc) else "INVALID_MESSAGE"
+            await _gateway_error(websocket, robot_id, detail)
+            await websocket.close(code=4400 if detail == "INVALID_MESSAGE" else 4406)
+            return
+        if hello.type != "hello" or hello.robot_id != robot_id or not _gateway_order_guard.accept(hello):
+            await _gateway_error(websocket, robot_id, "HELLO_REQUIRED")
+            await websocket.close(code=4400)
+            return
+        connected = True
+        if not await status_service.gateway_connected(robot_id, connection_id):
+            connected = False
+            await websocket.send_json({
+                "version": PROTOCOL_VERSION, "type": "error",
+                "message_id": str(uuid.uuid4()), "robot_id": robot_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {"code": "ROBOT_ALREADY_CONNECTED"},
+            })
+            await websocket.close(code=4409)
+            return
+        await websocket.send_json({
+            "version": PROTOCOL_VERSION,
+            "type": "hello_ack",
+            "message_id": str(uuid.uuid4()),
+            "robot_id": robot_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "payload": {"accepted": True},
+        })
+
         while True:
-            data: dict[str, Any] = await websocket.receive_json()
-            await _handle_robot_message(robot_id, data)
+            raw = await websocket.receive_text()
+            try:
+                message = parse_envelope(raw, max_bytes=settings.ROBOT_GATEWAY_MAX_MESSAGE_BYTES)
+            except ValueError as exc:
+                detail = "UNSUPPORTED_VERSION" if "version" in str(exc) else "INVALID_MESSAGE"
+                await _gateway_error(websocket, robot_id, detail)
+                await websocket.close(code=4400 if detail == "INVALID_MESSAGE" else 4406)
+                return
+            if message.robot_id != robot_id:
+                await _gateway_error(websocket, robot_id, "ROBOT_ID_MISMATCH")
+                await websocket.close(code=4403)
+                return
+            if message.type == "hello":
+                await _gateway_error(websocket, robot_id, "UNAUTHORIZED_MESSAGE_TYPE")
+                continue
+            if not _gateway_order_guard.accept(message):
+                await _gateway_error(websocket, robot_id, "DUPLICATE_OR_OUT_OF_ORDER")
+                continue
+            if message.type == "heartbeat":
+                await status_service.update_heartbeat(robot_id)
+            elif message.type == "telemetry":
+                telemetry = TelemetryPayload.model_validate(message.payload)
+                await status_service.update_gateway_telemetry(robot_id, telemetry.model_dump(exclude_none=True))
+            elif message.type in {"command_ack", "command_result"}:
+                # Protocol reports only. This phase has no command sender or ROS adapter.
+                await hub.broadcast("robot.command_protocol_message", {
+                    "robot_id": robot_id, "type": message.type,
+                    "message_id": message.message_id, "payload": message.payload,
+                    "physical_execution_confirmed": False,
+                })
+            elif message.type == "error":
+                await hub.broadcast("robot.gateway_error", {
+                    "robot_id": robot_id, "payload": message.payload,
+                })
     except WebSocketDisconnect:
-        logger.info("Robot WebSocket disconnected")
-    except Exception:
-        logger.exception("Unexpected error on robot WebSocket")
+        logger.info("Robot gateway disconnected: robot_id=%s", robot_id)
+    except Exception as exc:
+        # Avoid logging inbound data, headers, or credentials.
+        logger.warning("Robot gateway protocol/session error for robot_id=%s (%s)", robot_id, type(exc).__name__)
+        try:
+            await _gateway_error(websocket, robot_id, "GATEWAY_ERROR")
+        except Exception:
+            pass
     finally:
-        pass  # Safety manager on_ws_disconnect wiring done in task 9
+        if connected:
+            await status_service.gateway_disconnected(robot_id, connection_id)
 
 
-async def _handle_robot_message(robot_id: str, data: dict[str, Any]) -> None:
-    """
-    Dispatch incoming robot telemetry messages to the appropriate handler.
-
-    Message format: { "type": "<msg_type>", "payload": { ... } }
-    """
-    msg_type: str = data.get("type", "")
-    payload: dict[str, Any] = data.get("payload", {})
-
-    if msg_type == "robot.heartbeat":
-        # Requirement 3.1 — update last_seen and keep ONLINE status
-        battery = payload.get("battery_level")
-        await status_service.update_heartbeat(robot_id)
-        if battery is not None:
-            await _update_battery(robot_id, float(battery))
-
-    elif msg_type == "robot.pose_update":
-        # Requirement 3.5 — store and broadcast pose
-        await status_service.update_pose(
-            robot_id,
-            x=float(payload.get("x", 0)),
-            y=float(payload.get("y", 0)),
-            theta=float(payload.get("theta", 0)),
-        )
-
-    elif msg_type == "robot.mode_change":
-        # Requirement 3.4 — persist and broadcast control mode
-        try:
-            mode = ControlMode(payload.get("mode"))
-            await status_service.update_control_mode(robot_id, mode)
-        except ValueError:
-            logger.warning("Unknown control mode received: %s", payload.get("mode"))
-
-    elif msg_type == "robot.safety_update":
-        # Requirement 3.6 — persist and broadcast safety state
-        try:
-            state = SafetyState(payload.get("safety_state"))
-            await status_service.update_safety_state(robot_id, state)
-        except ValueError:
-            logger.warning("Unknown safety state received: %s", payload.get("safety_state"))
-
-    else:
-        logger.debug("Unhandled robot message type: %s", msg_type)
-
-
-async def _update_battery(robot_id: str, level: float) -> None:
-    from app.db.session import AsyncSessionLocal
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Robot).where(Robot.id == robot_id))
-        robot = result.scalar_one_or_none()
-        if robot:
-            robot.battery_level = level
-            await db.commit()
+async def _gateway_error(websocket: WebSocket, robot_id: str, code: str) -> None:
+    await websocket.send_json({
+        "version": PROTOCOL_VERSION,
+        "type": "error",
+        "message_id": str(uuid.uuid4()),
+        "robot_id": robot_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "payload": {"code": code},
+    })

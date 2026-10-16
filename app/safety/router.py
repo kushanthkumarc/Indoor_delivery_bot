@@ -66,6 +66,10 @@ class SafetyStateResponse(BaseModel):
         False,
         description="Whether explicit mode re-selection is required",
     )
+    physical_execution_confirmed: bool = Field(
+        False,
+        description="False unless a supported physical transport explicitly confirms execution",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +164,6 @@ async def trigger_emergency_stop(
         source="api",
         reason=request.reason,
     )
-
     return SafetyStateResponse(
         control_mode=await safety_manager.get_current_mode(),
         safety_state=await safety_manager.get_current_safety_state(),

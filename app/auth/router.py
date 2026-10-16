@@ -12,13 +12,14 @@ Auth events are written to the events audit table (Requirement 1.10).
 
 from datetime import timezone
 from typing import Annotated
+from uuid import uuid4
 
 import jwt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import AuthenticatedSession, get_current_session, get_current_user
 from app.auth.jwt import create_access_token, create_refresh_token, decode_token
 from app.auth.service import (
     authenticate_user,
@@ -26,6 +27,8 @@ from app.auth.service import (
     check_rate_limit,
     get_rate_limit_ttl,
     is_blacklisted,
+    is_session_revoked,
+    revoke_session,
     register_user,
 )
 from app.core.config import settings
@@ -133,10 +136,11 @@ def _clear_refresh_cookie(response: Response) -> None:
 
 
 def _client_ip(request: Request) -> str:
-    """Best-effort client IP extraction."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """Use the ASGI peer address after trusted-proxy middleware processing.
+
+    Reading X-Forwarded-For directly lets callers spoof the rate-limit key.
+    Configure Uvicorn's trusted proxy list to match the deployment ingress.
+    """
     return request.client.host if request.client else "unknown"
 
 
@@ -206,8 +210,9 @@ async def login(
             detail={"error": "INVALID_CREDENTIALS"},
         )
 
-    access_token = create_access_token(str(user.id), user.email, user.role.value)
-    refresh_token, _jti = create_refresh_token(str(user.id))
+    session_id = str(uuid4())
+    access_token = create_access_token(str(user.id), user.email, user.role.value, session_id)
+    refresh_token, _jti = create_refresh_token(str(user.id), session_id)
 
     _set_refresh_cookie(response, refresh_token)
 
@@ -239,11 +244,8 @@ async def register(
     redis=Depends(get_redis),
 ) -> RegisterResponse:
     """
-    Public self-registration endpoint (ERP-style).
-
-    Bootstrap rule:
-      - If no active ADMIN exists yet, the new user is created as role=ADMIN.
-      - Otherwise the new user is created as role=USER (zero robot access).
+    Public self-registration always creates a USER. The first administrator
+    must be provisioned through startup environment credentials.
 
     Rate-limited to 5 attempts per 15 min per IP (same as login).
     Fails closed (503) if the rate-limiter (Redis) is unreachable.
@@ -271,20 +273,21 @@ async def register(
         )
 
     try:
-        user, became_admin = await register_user(db, body.email, body.password, body.name)
+        user, _became_admin = await register_user(db, body.email, body.password, body.name)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"error": "EMAIL_ALREADY_EXISTS", "message": str(exc)},
         )
 
-    access_token = create_access_token(str(user.id), user.email, user.role.value)
-    refresh_token, _jti = create_refresh_token(str(user.id))
+    session_id = str(uuid4())
+    access_token = create_access_token(str(user.id), user.email, user.role.value, session_id)
+    refresh_token, _jti = create_refresh_token(str(user.id), session_id)
     _set_refresh_cookie(response, refresh_token)
 
     await _log_event(
         db,
-        "auth.bootstrap_admin" if became_admin else "auth.register",
+        "auth.register",
         EventSeverity.INFO,
         user_id=str(user.id),
         payload={"ip": ip, "role": user.role.value},
@@ -366,11 +369,17 @@ async def refresh_token(
         raise _401
 
     jti = payload.get("jti")
-    if not jti:
+    session_id = payload.get("sid")
+    if not jti or not session_id:
         raise _401
 
-    if await is_blacklisted(redis, jti):
-        raise _401
+    try:
+        if await is_blacklisted(redis, jti) or await is_session_revoked(redis, session_id):
+            raise _401
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail={"error": "AUTH_UNAVAILABLE"}) from None
 
     user_id: str = payload["sub"]
 
@@ -386,10 +395,13 @@ async def refresh_token(
     import time
 
     remaining_ttl = max(int(exp - time.time()), 1)
-    await blacklist_token(redis, jti, remaining_ttl)
+    try:
+        await blacklist_token(redis, jti, remaining_ttl)
+    except Exception:
+        raise HTTPException(status_code=503, detail={"error": "AUTH_UNAVAILABLE"}) from None
 
-    new_access = create_access_token(str(user.id), user.email, user.role.value)
-    new_refresh, _new_jti = create_refresh_token(str(user.id))
+    new_access = create_access_token(str(user.id), user.email, user.role.value, session_id)
+    new_refresh, _new_jti = create_refresh_token(str(user.id), session_id)
     _set_refresh_cookie(response, new_refresh)
 
     return TokenResponse(access_token=new_access)
@@ -404,24 +416,38 @@ async def logout(
     response: Response,
     db: Annotated[AsyncSession, Depends(get_db)],
     redis=Depends(get_redis),
-    current_user: User = Depends(get_current_user),
+    session: AuthenticatedSession = Depends(get_current_session),
     refresh_token: str | None = Cookie(default=None, alias=_REFRESH_COOKIE),
 ) -> None:
     """
-    Invalidate the refresh token server-side via Redis blacklist (Requirement 1.5).
+    Revoke this login session and its refresh token before clearing the cookie.
     """
+    import time
+
+    refresh_jti: str | None = None
+    refresh_ttl: int | None = None
     if refresh_token:
         try:
             payload = decode_token(refresh_token)
-            jti = payload.get("jti")
-            exp = payload.get("exp", 0)
-            if jti:
-                import time
-
-                remaining_ttl = max(int(exp - time.time()), 1)
-                await blacklist_token(redis, jti, remaining_ttl)
+            if payload.get("type") == "refresh" and payload.get("sid") == session.session_id:
+                refresh_jti = payload.get("jti")
+                refresh_ttl = max(int(payload.get("exp", 0) - time.time()), 1)
         except jwt.InvalidTokenError:
-            pass  # Already invalid — still clear the cookie
+            pass  # Invalid refresh cookie does not prevent access-session revocation
+
+    # Keep the session revocation marker for at least the configured refresh
+    # lifetime so every token created by this session remains unusable.
+    revoke_ttl = max(
+        session.expires_at - int(time.time()),
+        refresh_ttl or 0,
+        settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+    )
+    try:
+        await revoke_session(redis, session.session_id, revoke_ttl)
+        if refresh_jti:
+            await blacklist_token(redis, refresh_jti, refresh_ttl or 1)
+    except Exception:
+        raise HTTPException(status_code=503, detail={"error": "AUTH_UNAVAILABLE"}) from None
 
     _clear_refresh_cookie(response)
 
@@ -429,7 +455,7 @@ async def logout(
         db,
         "auth.logout",
         EventSeverity.INFO,
-        user_id=str(current_user.id),
+        user_id=str(session.user.id),
         payload={},
     )
 

@@ -1,6 +1,7 @@
 """Phase 5: WebSocket integration test (v3 - proper close detection)."""
 import asyncio
 import json
+import os
 import sys
 
 import httpx
@@ -8,11 +9,11 @@ import websockets
 
 BASE = "http://127.0.0.1:8000"
 WS_BASE = "ws://127.0.0.1:8000"
-ADMIN_EMAIL = "admin@example.com"
-ADMIN_PASSWORD = "change-me-admin-password"
+ADMIN_EMAIL = os.environ.get("E2E_ADMIN_EMAIL", "")
+ADMIN_PASSWORD = os.environ.get("E2E_ADMIN_PASSWORD", "")
 USER_EMAIL = "testuser@example.com"
 USER_PASSWORD = "TestUser!234"
-ROBOT_API_KEY = "change-me-robot-key"
+ROBOT_API_KEY = os.environ.get("E2E_ROBOT_API_KEY", "")
 
 results = []
 
@@ -58,9 +59,18 @@ async def try_ws(url):
 
 
 async def main():
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        raise RuntimeError("Set E2E_ADMIN_EMAIL and E2E_ADMIN_PASSWORD for this live integration script")
     async with httpx.AsyncClient(base_url=BASE, timeout=10.0) as c:
         admin_token = await login(c, ADMIN_EMAIL, ADMIN_PASSWORD)
         user_token = await login(c, USER_EMAIL, USER_PASSWORD)
+        admin_ticket_response = await c.post(
+            "/dashboard/ws-ticket", headers={"Authorization": f"Bearer {admin_token}"}
+        ) if admin_token else None
+        user_ticket_response = await c.post(
+            "/dashboard/ws-ticket", headers={"Authorization": f"Bearer {user_token}"}
+        ) if user_token else None
+        admin_ticket = admin_ticket_response.json().get("ticket") if admin_ticket_response and admin_ticket_response.status_code == 200 else None
     print(f"admin_token: {'OK' if admin_token else 'MISSING'}")
     print(f"user_token:  {'OK' if user_token else 'MISSING'}")
 
@@ -77,28 +87,25 @@ async def main():
     record("Robot WS wrong api_key -> close 4001", "4001", code)
 
     # 4. Dashboard WS admin
-    code, kind = await try_ws(f"{WS_BASE}/ws/dashboard?token={admin_token}")
+    code, kind = await try_ws(f"{WS_BASE}/ws/dashboard?ticket={admin_ticket}")
     record("Dashboard WS admin -> snapshot", "msg", code, f"kind={kind}")
 
-    # 5. Dashboard WS USER token
-    if user_token:
-        code, kind = await try_ws(f"{WS_BASE}/ws/dashboard?token={user_token}")
-        record("Dashboard WS USER -> close 4003", "4003", code, "kind=" + kind)
-    else:
-        record("Dashboard WS USER", "skip", "no token")
+    # 5. Non-admin must not be allowed to mint a dashboard ticket.
+    user_ticket_status = user_ticket_response.status_code if user_ticket_response else "no token"
+    record("Dashboard ticket USER -> HTTP 403", 403, user_ticket_status)
 
     # 6. Dashboard WS no token
     code, kind = await try_ws(f"{WS_BASE}/ws/dashboard")
     record("Dashboard WS no token -> close 4001", "4001", code)
 
     # 7. Dashboard WS invalid token
-    code, kind = await try_ws(f"{WS_BASE}/ws/dashboard?token=invalid.token.value")
+    code, kind = await try_ws(f"{WS_BASE}/ws/dashboard?ticket=invalid-one-use-ticket")
     record("Dashboard WS invalid token -> close 4001", "4001", code)
 
     # 8. Two-way broadcast: dashboard listens, robot sends heartbeat
     print("\n[8] Heartbeat broadcast...")
     try:
-        ws_dash = await websockets.connect(f"{WS_BASE}/ws/dashboard?token={admin_token}", open_timeout=5, ping_interval=None)
+        ws_dash = await websockets.connect(f"{WS_BASE}/ws/dashboard?ticket={admin_ticket}", open_timeout=5, ping_interval=None)
         # Drain snapshot
         snap = await asyncio.wait_for(ws_dash.recv(), timeout=3.0)
         snap_data = json.loads(snap)

@@ -21,7 +21,9 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def create_access_token(user_id: str, email: str, role: str) -> str:
+def create_access_token(
+    user_id: str, email: str, role: str, session_id: str | None = None,
+) -> str:
     """Create a short-lived JWT access token (Requirement 1.3)."""
     expire = _now_utc() + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
     payload: dict[str, Any] = {
@@ -29,13 +31,17 @@ def create_access_token(user_id: str, email: str, role: str) -> str:
         "email": email,
         "role": role,
         "type": _ACCESS_TYPE,
+        "jti": str(uuid4()),
+        "sid": session_id or str(uuid4()),
         "iat": _now_utc(),
         "exp": expire,
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 
-def create_refresh_token(user_id: str) -> tuple[str, str]:
+def create_refresh_token(
+    user_id: str, session_id: str | None = None,
+) -> tuple[str, str]:
     """
     Create a long-lived refresh token.
 
@@ -48,6 +54,7 @@ def create_refresh_token(user_id: str) -> tuple[str, str]:
         "sub": user_id,
         "type": _REFRESH_TYPE,
         "jti": jti,
+        "sid": session_id or str(uuid4()),
         "iat": _now_utc(),
         "exp": expire,
     }

@@ -2,7 +2,7 @@
 Nav2 Bridge module — Module 5.
 
 Provides the Nav2Bridge interface and implementations for communicating
-with the robot's navigation system via rosbridge or simulation mode.
+with the robot's navigation system via rosbridge.
 """
 
 from app.nav2.bridge import (
