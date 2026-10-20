@@ -40,6 +40,7 @@ from app.db.redis import get_redis
 from app.dashboard.service import RobotStatusService, status_service
 from app.dashboard.ws_hub import DashboardWSHub, hub
 from app.gateway.protocol import MessageOrderGuard, PROTOCOL_VERSION, TelemetryPayload, parse_envelope
+from app.gateway.navigation import gateway_navigation
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +318,14 @@ async def robot_ws(
             })
             await websocket.close(code=4409)
             return
+        send_lock = asyncio.Lock()
+
+        async def _send_to_robot(envelope: dict) -> None:
+            async with send_lock:
+                await websocket.send_json(envelope)
+
+        if settings.ROBOT_COMMAND_CHANNEL_ENABLED:
+            gateway_navigation.register_connection(robot_id, connection_id, _send_to_robot)
         await websocket.send_json({
             "version": PROTOCOL_VERSION,
             "type": "hello_ack",
@@ -351,7 +360,9 @@ async def robot_ws(
                 telemetry = TelemetryPayload.model_validate(message.payload)
                 await status_service.update_gateway_telemetry(robot_id, telemetry.model_dump(exclude_none=True))
             elif message.type in {"command_ack", "command_result"}:
-                # Protocol reports only. This phase has no command sender or ROS adapter.
+                # Protocol reports only; they never confirm physical execution.
+                if settings.ROBOT_COMMAND_CHANNEL_ENABLED:
+                    await gateway_navigation.handle_report(robot_id, message.type, message.payload)
                 await hub.broadcast("robot.command_protocol_message", {
                     "robot_id": robot_id, "type": message.type,
                     "message_id": message.message_id, "payload": message.payload,
@@ -372,6 +383,7 @@ async def robot_ws(
             pass
     finally:
         if connected:
+            gateway_navigation.unregister_connection(robot_id, connection_id)
             await status_service.gateway_disconnected(robot_id, connection_id)
 
 

@@ -82,6 +82,13 @@ async def on_startup() -> None:
         from app.dashboard.service import status_service
         status_service.start_monitor()
 
+        if settings.ROBOT_COMMAND_CHANNEL_ENABLED:
+            from app.delivery import router as delivery_module
+            from app.delivery.state_machine import DeliveryStateMachine
+            from app.gateway.navigation import gateway_navigation
+            delivery_module.delivery_state_machine = DeliveryStateMachine(
+                gateway_navigation, freshness_check=status_service.connection_freshness)
+            logger.info("Robot command channel enabled (goal commands over gateway socket)")
         if settings.ROSBRIDGE_ENABLED:
             from app.rosbridge.client import RosbridgeClient
             client = RosbridgeClient()

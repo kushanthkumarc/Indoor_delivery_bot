@@ -101,6 +101,7 @@ async def test_cloud_startup_skips_ros_client_and_keeps_telemetry_unasserted(mon
 
     monkeypatch.setattr(main_module, "settings", SimpleNamespace(
         ROSBRIDGE_ENABLED=False, RUN_MIGRATIONS_ON_STARTUP=False,
+        ROBOT_COMMAND_CHANNEL_ENABLED=False,
     ))
     monkeypatch.setattr(main_module, "validate_production_settings", lambda: True)
     monkeypatch.setattr(main_module, "AsyncSessionLocal", Session)
