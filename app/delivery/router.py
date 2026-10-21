@@ -163,7 +163,7 @@ async def create_delivery(
 
 @router.get("")
 async def get_all_deliveries(
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_admin())],
 ) -> Any:
     """
     Get all deliveries. ADMIN only.
@@ -209,7 +209,7 @@ async def get_delivery(
 @router.post("/{delivery_id}/dispatch")
 async def dispatch_delivery(
     delivery_id: str,
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_admin())],
 ) -> Any:
     """
     Dispatch delivery to robot (ADMIN only).
@@ -239,9 +239,9 @@ async def confirm_pickup(
     Requirement 5.4
     """
     delivery, _robot, _destination = await _load_delivery(delivery_id)
-    state_machine = _require_navigation()
     if current_user.role != UserRole.ADMIN and str(delivery.requester_id) != _actor_id(current_user):
         raise HTTPException(status_code=403, detail={"error": "DELIVERY_ACCESS_DENIED"})
+    state_machine = _require_navigation()
     try:
         updated = await state_machine.on_pickup_confirmed(delivery_id, _actor_id(current_user))
     except InvalidTransitionError as exc:
@@ -255,7 +255,7 @@ async def confirm_pickup(
 @router.post("/{delivery_id}/cancel")
 async def cancel_delivery(
     delivery_id: str,
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_admin())],
 ) -> Any:
     """Request cancellation (ADMIN only); this does not verify physical stopping."""
     await _load_delivery(delivery_id)
