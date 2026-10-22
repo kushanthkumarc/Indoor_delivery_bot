@@ -139,7 +139,7 @@ async def test_authentication_and_ticket_operations_fail_closed_when_redis_is_do
     ws.accept = accept
     ws.close = close
     assert await dashboard_router._ws_auth(ws, "ticket") is None
-    assert ws.close_code == 1013
+    assert ws.close_code == 4003
 
 
 @pytest.mark.asyncio
