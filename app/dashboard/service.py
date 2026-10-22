@@ -41,6 +41,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Return a timezone-aware UTC datetime from a persisted or parsed value."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _robot_to_dict(robot: Robot) -> dict[str, Any]:
     """Serialise a Robot ORM instance to a plain dict for WS / REST responses."""
     return {
@@ -292,6 +299,7 @@ class RobotStatusService:
 
             for robot in online_robots:
                 timed_out = False
+                last_seen = _as_utc(robot.last_seen) if robot.last_seen else None
 
                 # Check Redis key first (fast path)
                 key = f"{_HEARTBEAT_KEY_PREFIX}{robot.id}"
@@ -301,14 +309,13 @@ class RobotStatusService:
                     # Redis can be unavailable/expired before the DB timeout.
                     # DB last_seen is authoritative for the timeout boundary.
                     timed_out = bool(
-                        robot.last_seen is None
-                        or (now - robot.last_seen.replace(tzinfo=timezone.utc)
-                            if robot.last_seen.tzinfo is None else now - robot.last_seen).total_seconds()
+                        last_seen is None
+                        or (now - last_seen).total_seconds()
                         > _HEARTBEAT_TIMEOUT_S
                     )
                 else:
                     try:
-                        last_seen_dt = datetime.fromisoformat(last_seen_str)
+                        last_seen_dt = _as_utc(datetime.fromisoformat(last_seen_str))
                         elapsed = (now - last_seen_dt).total_seconds()
                         if elapsed > _HEARTBEAT_TIMEOUT_S:
                             timed_out = True
@@ -316,8 +323,8 @@ class RobotStatusService:
                         timed_out = True
 
                 # Also check DB last_seen as a fallback
-                if not timed_out and robot.last_seen:
-                    elapsed_db = (now - robot.last_seen).total_seconds()
+                if not timed_out and last_seen:
+                    elapsed_db = (now - last_seen).total_seconds()
                     if elapsed_db > _HEARTBEAT_TIMEOUT_S:
                         timed_out = True
 

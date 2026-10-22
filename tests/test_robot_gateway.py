@@ -132,6 +132,19 @@ def test_gateway_freshness_transitions():
     assert service.connection_freshness("r", now - timedelta(seconds=6), now) == "OFFLINE"
 
 
+def test_as_utc_normalizes_naive_and_offset_aware_timestamps():
+    naive = datetime(2026, 10, 22, 18, 0, 0)
+    offset_aware = datetime.fromisoformat("2026-10-22T23:30:00+05:30")
+
+    naive_result = dashboard_service._as_utc(naive)
+    offset_result = dashboard_service._as_utc(offset_aware)
+
+    assert naive_result.tzinfo is timezone.utc
+    assert naive_result.isoformat() == "2026-10-22T18:00:00+00:00"
+    assert offset_result.tzinfo is timezone.utc
+    assert offset_result.isoformat() == "2026-10-22T18:00:00+00:00"
+
+
 @pytest.mark.asyncio
 async def test_gateway_disconnect_and_reconnect(monkeypatch):
     robot = SimpleNamespace(status=RobotStatus.ONLINE)
@@ -196,6 +209,41 @@ async def test_missing_redis_heartbeat_uses_db_timeout_boundary(monkeypatch):
         "robot_id": "robot-1", "connection_state": "STALE",
         "last_seen": robot.last_seen.isoformat(),
     })
+
+
+@pytest.mark.asyncio
+async def test_connected_robot_without_heartbeats_becomes_offline(monkeypatch):
+    now = datetime.now(timezone.utc)
+    robot = SimpleNamespace(
+        id="robot-1", status=RobotStatus.ONLINE,
+        last_seen=(now - timedelta(seconds=6)).replace(tzinfo=None),
+    )
+
+    class Result:
+        def scalars(self): return self
+        def all(self): return [robot]
+
+    class Session:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_args): return None
+        async def execute(self, _query): return Result()
+        async def commit(self): return None
+
+    redis = SimpleNamespace(get=AsyncMock(return_value=None))
+    monkeypatch.setattr(dashboard_service, "get_redis", AsyncMock(return_value=redis))
+    monkeypatch.setattr(dashboard_service, "AsyncSessionLocal", Session)
+    monkeypatch.setattr(dashboard_service, "_utcnow", lambda: now)
+    monkeypatch.setattr(dashboard_service, "log_event", AsyncMock())
+    service = RobotStatusService(hub=AsyncMock())
+    service._gateway_connected["robot-1"] = "session-1"
+
+    await service._check_all_robots()
+
+    assert robot.status == RobotStatus.OFFLINE
+    service._hub.broadcast.assert_any_await(
+        "robot.offline",
+        {"robot_id": "robot-1", "last_seen": robot.last_seen.isoformat()},
+    )
 
 
 @pytest.mark.asyncio
