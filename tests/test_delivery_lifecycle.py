@@ -229,3 +229,125 @@ async def test_transition_event_failure_rolls_back_and_cancels_started_goal(db_f
     assert adapter.start_count == 1
     goal_id = next(iter(adapter.goals))
     assert adapter.goals[goal_id][2].result().status == GoalStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_mapped_source_requires_loading_before_destination(db_factory):
+    async with db_factory() as db:
+        delivery = await db.get(Delivery, "delivery-1")
+        delivery.source_id = "home-1"
+        await db.commit()
+    adapter = ScriptedTestNavigation()
+    machine = DeliveryStateMachine(adapter)
+    source = await machine.dispatch("delivery-1", "admin-1")
+    assert source.status == DeliveryStatus.AT_SOURCE
+    assert adapter.start_count == 1
+    assert adapter.goals[source.nav_goal_id][0].x == -4.0
+    with pytest.raises(InvalidTransitionError):
+        await machine.dispatch("delivery-1", "admin-1")
+    arrived = await machine.dispatch("delivery-1", "user-1", loading_confirmed=True)
+    assert arrived.status == DeliveryStatus.ARRIVED
+    assert adapter.start_count == 2
+    assert adapter.goals[arrived.nav_goal_id][0].x == 2.5
+    assert [h["to"] for h in arrived.state_history_json] == [
+        "GO_TO_SOURCE", "AT_SOURCE", "GO_TO_DESTINATION", "ARRIVED"]
+    completed = await machine.on_pickup_confirmed("delivery-1", "user-1")
+    assert completed.status == DeliveryStatus.DELIVERED
+    assert completed.completed_at is not None
+    assert adapter.start_count == 2  # Receipt never starts an unrequested return trip.
+
+
+@pytest.mark.asyncio
+async def test_loading_is_rejected_before_source_arrival(db_factory):
+    adapter = ScriptedTestNavigation()
+    with pytest.raises(InvalidTransitionError):
+        await DeliveryStateMachine(adapter).dispatch("delivery-1", "user-1", loading_confirmed=True)
+    assert adapter.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_source_loading_permission(db_factory, monkeypatch):
+    import app.delivery.router as routes
+    monkeypatch.setattr(routes, "AsyncSessionLocal", db_factory)
+    async with db_factory() as db:
+        other = await db.get(User, "user-2")
+    with pytest.raises(HTTPException) as denied:
+        await routes.confirm_loading("delivery-1", other)
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_source_receipt_does_not_require_navigation_transport(db_factory, monkeypatch):
+    import app.delivery.router as routes
+    monkeypatch.setattr(routes, "AsyncSessionLocal", db_factory)
+    monkeypatch.setattr(routes, "delivery_state_machine", None)
+    async with db_factory() as db:
+        delivery = await db.get(Delivery, "delivery-1")
+        delivery.source_id = "home-1"
+        delivery.status = DeliveryStatus.ARRIVED
+        owner = await db.get(User, "user-1")
+        other = await db.get(User, "user-2")
+        await db.commit()
+    with pytest.raises(HTTPException) as denied:
+        await routes.confirm_pickup("delivery-1", other)
+    assert denied.value.status_code == 403
+    result = await routes.confirm_pickup("delivery-1", owner)
+    assert result["status"] == "DELIVERED"
+    assert result["physical_execution_confirmed"] is False
+    assert (await get_delivery(db_factory)).completed_at is not None
+    with pytest.raises(HTTPException) as repeated:
+        await routes.confirm_pickup("delivery-1", owner)
+    assert repeated.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_route_creation_persists_locations_while_robot_offline(db_factory, monkeypatch):
+    import app.delivery.router as routes
+    from app.db.models import UserRobotAccess
+    monkeypatch.setattr(routes, "AsyncSessionLocal", db_factory)
+    async with db_factory() as db:
+        user = await db.get(User, "user-1")
+        robot = await db.get(Robot, "robot-1")
+        robot.status = RobotStatus.OFFLINE
+        robot.control_mode = ControlMode.STOPPED
+        db.add(UserRobotAccess(user_id=user.id, robot_id=robot.id, granted_by="admin-1"))
+        await db.commit()
+    created = await routes.create_delivery(routes.CreateDeliveryRequest(
+        source_id="home-1", destination_id="dest-1", robot_id="robot-1"), user)
+    assert created["source_id"] == "home-1"
+    assert created["source_name"] == "Home"
+    assert created["destination_name"] == "Drop"
+    assert created["status"] == "IDLE"
+    assert created["physical_execution_confirmed"] is False
+    listed = await routes.get_my_deliveries(user)
+    assert any(d["id"] == created["id"] and d["source_name"] == "Home" for d in listed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,destination,code", [("home-1", "home-1", 422), ("missing", "dest-1", 404)])
+async def test_invalid_route_rejected(db_factory, monkeypatch, source, destination, code):
+    import app.delivery.router as routes
+    monkeypatch.setattr(routes, "AsyncSessionLocal", db_factory)
+    async with db_factory() as db:
+        admin = await db.get(User, "admin-1")
+    with pytest.raises(HTTPException) as error:
+        await routes.create_delivery(routes.CreateDeliveryRequest(
+            source_id=source, destination_id=destination, robot_id="robot-1"), admin)
+    assert error.value.status_code == code
+
+
+@pytest.mark.asyncio
+async def test_cross_map_route_and_ungranted_user_rejected(db_factory, monkeypatch):
+    import app.delivery.router as routes
+    monkeypatch.setattr(routes, "AsyncSessionLocal", db_factory)
+    async with db_factory() as db:
+        admin = await db.get(User, "admin-1")
+        user = await db.get(User, "user-2")
+        db.add(MappingSession(id="map-2", robot_id="robot-1", status=MappingSessionStatus.FINISHED))
+        db.add(Destination(id="cross-map", name="Other floor", map_id="map-2", x=1, y=2, theta=0))
+        await db.commit()
+    for actor, source, code in [(admin, "cross-map", 409), (user, "home-1", 403)]:
+        with pytest.raises(HTTPException) as error:
+            await routes.create_delivery(routes.CreateDeliveryRequest(
+                source_id=source, destination_id="dest-1", robot_id="robot-1"), actor)
+        assert error.value.status_code == code

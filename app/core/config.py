@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    # Authentication throttling. Keep the secure production defaults; local
+    # demo environments may raise these values explicitly in .env.
+    AUTH_RATE_LIMIT_MAX_ATTEMPTS: int = 5
+    AUTH_RATE_LIMIT_WINDOW_S: int = 15 * 60
+
     # Robot authentication
     ROBOT_API_KEY: str = "change-me-robot-key"
 
@@ -109,6 +114,14 @@ class Settings(BaseSettings):
             raise ValueError("HEARTBEAT_TIMEOUT_S must be positive")
         if not 0 < self.ROBOT_STALE_AFTER_S < self.HEARTBEAT_TIMEOUT_S:
             raise ValueError("ROBOT_STALE_AFTER_S must be positive and less than HEARTBEAT_TIMEOUT_S")
+        return self
+
+    @model_validator(mode="after")
+    def validate_auth_rate_limit(self) -> "Settings":
+        if self.AUTH_RATE_LIMIT_MAX_ATTEMPTS < 1:
+            raise ValueError("AUTH_RATE_LIMIT_MAX_ATTEMPTS must be positive")
+        if self.AUTH_RATE_LIMIT_WINDOW_S < 1:
+            raise ValueError("AUTH_RATE_LIMIT_WINDOW_S must be positive")
         return self
 
     @field_validator("REDIS_URL")

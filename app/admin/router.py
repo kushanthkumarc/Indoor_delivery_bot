@@ -85,7 +85,6 @@ class CreateRobotRequest(BaseModel):
 class ProvisionedRobotResponse(BaseModel):
     id: str
     name: str
-    api_key: str
     status: str
     created_at: str
 
@@ -361,7 +360,7 @@ async def create_robot(
     db: Annotated[AsyncSession, Depends(get_db)],
     admin: User = _require_admin,
 ) -> ProvisionedRobotResponse:
-    """Provision a robot and return its gateway key once. ADMIN-only."""
+    """Provision a robot without returning its gateway credential. ADMIN-only."""
     api_key = secrets.token_urlsafe(32)
     api_key_hash = await run_in_threadpool(
         lambda: bcrypt.hashpw(api_key.encode(), bcrypt.gensalt(rounds=12)).decode()
@@ -390,7 +389,6 @@ async def create_robot(
     return ProvisionedRobotResponse(
         id=str(robot.id),
         name=robot.name,
-        api_key=api_key,
         status=robot.status.value,
         created_at=robot.created_at.isoformat(),
     )

@@ -11,14 +11,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Event, EventSeverity, User, UserRole
+from app.core.config import settings
 
 # Redis key prefixes
 _BLACKLIST_PREFIX = "auth:blacklist:"
 _SESSION_REVOKED_PREFIX = "auth:session-revoked:"
 _RATE_LIMIT_PREFIX = "auth:rate:"
 
-_MAX_LOGIN_ATTEMPTS = 5
-_RATE_LIMIT_WINDOW_S = 15 * 60  # 15 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +116,8 @@ async def check_rate_limit(redis: Redis, ip: str) -> bool:
                      type(e).__name__)
         raise
     if count == 1:
-        await redis.expire(key, _RATE_LIMIT_WINDOW_S)
-    return count <= _MAX_LOGIN_ATTEMPTS
+        await redis.expire(key, settings.AUTH_RATE_LIMIT_WINDOW_S)
+    return count <= settings.AUTH_RATE_LIMIT_MAX_ATTEMPTS
 
 
 async def get_rate_limit_ttl(redis: Redis, ip: str) -> int:

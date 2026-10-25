@@ -78,6 +78,8 @@ class SlamStatusEnum(str, enum.Enum):
 
 class DeliveryStatus(str, enum.Enum):
     IDLE = "IDLE"
+    GO_TO_SOURCE = "GO_TO_SOURCE"
+    AT_SOURCE = "AT_SOURCE"
     GO_TO_DESTINATION = "GO_TO_DESTINATION"
     ARRIVED = "ARRIVED"
     DELIVERED = "DELIVERED"
@@ -285,7 +287,7 @@ class Destination(Base):
         "MappingSession", back_populates="destinations"
     )
     deliveries: Mapped[list["Delivery"]] = relationship(
-        "Delivery", back_populates="destination"
+        "Delivery", back_populates="destination", foreign_keys="Delivery.destination_id"
     )
 
     __table_args__ = (Index("ix_destinations_map_id", "map_id"),)
@@ -303,6 +305,10 @@ class Delivery(Base):
         CHAR(36),
         ForeignKey("robots.id", ondelete="RESTRICT"),
         nullable=False,
+    )
+    # Nullable only for deliveries created before explicit pickup locations existed.
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        CHAR(36), ForeignKey("destinations.id", ondelete="RESTRICT"), nullable=True
     )
     destination_id: Mapped[uuid.UUID] = mapped_column(
         CHAR(36),
@@ -336,7 +342,7 @@ class Delivery(Base):
     # Relationships
     robot: Mapped["Robot"] = relationship("Robot", back_populates="deliveries")
     destination: Mapped["Destination"] = relationship(
-        "Destination", back_populates="deliveries"
+        "Destination", back_populates="deliveries", foreign_keys=[destination_id]
     )
     requester: Mapped["User"] = relationship(
         "User",

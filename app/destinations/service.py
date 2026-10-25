@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -28,6 +28,8 @@ from app.events.service import log_event
 # Delivery statuses that mean the destination is still "in use"
 _ACTIVE_DELIVERY_STATUSES = {
     DeliveryStatus.IDLE,
+    DeliveryStatus.GO_TO_SOURCE,
+    DeliveryStatus.AT_SOURCE,
     DeliveryStatus.GO_TO_DESTINATION,
     DeliveryStatus.ARRIVED,
     DeliveryStatus.DELIVERED,
@@ -164,6 +166,7 @@ async def get_destination(db: AsyncSession, destination_id: str) -> Destination:
 async def list_destinations(
     db: AsyncSession,
     map_id: str | None = None,
+    robot_ids: list[str] | None = None,
 ) -> list[Destination]:
     """
     Return all destinations, optionally filtered by map_id (Requirement 4.5).
@@ -171,6 +174,10 @@ async def list_destinations(
     stmt = select(Destination).order_by(Destination.created_at.asc())
     if map_id is not None:
         stmt = stmt.where(Destination.map_id == map_id)
+    if robot_ids is not None:
+        stmt = stmt.join(MappingSession, Destination.map_id == MappingSession.id).where(
+            MappingSession.robot_id.in_(robot_ids)
+        )
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
@@ -240,9 +247,9 @@ async def delete_destination(
     # Check for active deliveries referencing this destination
     active_result = await db.execute(
         select(Delivery).where(
-            Delivery.destination_id == destination_id,
+            or_(Delivery.destination_id == destination_id, Delivery.source_id == destination_id),
             Delivery.status.in_(_ACTIVE_DELIVERY_STATUSES),
-        )
+        ).limit(1)
     )
     active_delivery = active_result.scalar_one_or_none()
     if active_delivery is not None:

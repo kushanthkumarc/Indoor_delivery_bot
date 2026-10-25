@@ -47,15 +47,18 @@ class DeliveryStateMachine:
     def _lock_for(self, delivery_id: str) -> asyncio.Lock:
         return self._locks.setdefault(delivery_id, asyncio.Lock())
 
-    async def dispatch(self, delivery_id: str, actor_id: str | None = None) -> Delivery:
+    async def dispatch(self, delivery_id: str, actor_id: str | None = None,
+                       *, loading_confirmed: bool = False) -> Delivery:
         async with self._lock_for(delivery_id):
             async with AsyncSessionLocal() as db:
                 delivery = await self._get_delivery(db, delivery_id, lock=True)
                 if delivery is None:
                     raise ValueError("Delivery not found")
-                if delivery.status == DeliveryStatus.GO_TO_DESTINATION and delivery.nav_goal_id:
+                expected = DeliveryStatus.GO_TO_DESTINATION if loading_confirmed or not delivery.source_id else DeliveryStatus.GO_TO_SOURCE
+                required = DeliveryStatus.AT_SOURCE if loading_confirmed else DeliveryStatus.IDLE
+                if delivery.status == expected and delivery.nav_goal_id:
                     return delivery
-                if delivery.status != DeliveryStatus.IDLE:
+                if delivery.status != required or (loading_confirmed and not delivery.source_id):
                     raise InvalidTransitionError(f"Cannot dispatch delivery in state {delivery.status.value}")
                 destination = await self._get_destination(db, delivery.destination_id)
                 if destination is None:
@@ -72,6 +75,14 @@ class DeliveryStateMachine:
                     raise InvalidTransitionError("Cannot dispatch unless robot is AUTONOMOUS")
                 if robot.safety_state != SafetyState.SAFE:
                     raise InvalidTransitionError("Cannot dispatch unless robot safety state is SAFE")
+                busy = await db.execute(select(Delivery.id).where(
+                    Delivery.robot_id == delivery.robot_id, Delivery.id != delivery.id,
+                    Delivery.status.in_([DeliveryStatus.GO_TO_SOURCE, DeliveryStatus.AT_SOURCE,
+                        DeliveryStatus.GO_TO_DESTINATION, DeliveryStatus.ARRIVED, DeliveryStatus.RETURN_HOME,
+                        DeliveryStatus.EMERGENCY_STOP])
+                ).limit(1))
+                if busy.first() is not None:
+                    raise InvalidTransitionError("Robot is busy with another delivery")
                 if self._freshness_check and self._freshness_check(str(robot.id), robot.last_seen) != "ONLINE":
                     raise InvalidTransitionError("Cannot dispatch while robot gateway telemetry is stale or offline")
                 map_result = await db.execute(select(MappingSession).where(
@@ -81,20 +92,27 @@ class DeliveryStateMachine:
                 ))
                 if map_result.scalar_one_or_none() is None:
                     raise InvalidTransitionError("Destination map is not a finished map for this robot")
+                target = destination
+                if delivery.source_id:
+                    source = await self._get_destination(db, delivery.source_id)
+                    if source is None or source.map_id != destination.map_id or source.id == destination.id:
+                        raise InvalidTransitionError("Pickup and destination must be distinct locations on the same finished map")
+                    if not loading_confirmed:
+                        target = source
                 goal_id = await self._navigation.start(
-                    Pose(destination.x, destination.y, destination.theta), delivery_id
+                    Pose(target.x, target.y, target.theta), delivery_id
                 )
                 try:
                     await self._transition(
-                        db, delivery, DeliveryStatus.GO_TO_DESTINATION, actor_id,
-                        "dispatch requested", goal_id=goal_id,
+                        db, delivery, expected, actor_id,
+                        "package loading confirmed" if loading_confirmed else "dispatch requested", goal_id=goal_id,
                     )
                     await db.commit()
                 except Exception:
                     await db.rollback()
                     await self._navigation.cancel(goal_id)
                     raise
-        return await self._await_navigation(delivery_id, goal_id, DeliveryStatus.GO_TO_DESTINATION, actor_id)
+        return await self._await_navigation(delivery_id, goal_id, expected, actor_id)
 
     async def on_pickup_confirmed(self, delivery_id: str, user_id: str) -> Delivery:
         async with self._lock_for(delivery_id):
@@ -104,6 +122,12 @@ class DeliveryStateMachine:
                     raise ValueError("Delivery not found")
                 if delivery.status != DeliveryStatus.ARRIVED:
                     raise InvalidTransitionError(f"Cannot confirm pickup in state {delivery.status.value}")
+                if delivery.source_id:
+                    # Explicit source-to-destination requests finish on receipt.
+                    # No return journey is implied by confirming the package.
+                    await self.record_source_receipt(db, delivery, user_id)
+                    await db.commit()
+                    return delivery
                 destination = await self._get_destination(db, delivery.destination_id)
                 if destination is None:
                     raise ValueError("Destination not found")
@@ -142,7 +166,7 @@ class DeliveryStateMachine:
                     raise ValueError("Delivery not found")
                 if delivery.status == DeliveryStatus.EMERGENCY_STOP:
                     return delivery
-                if delivery.status not in {DeliveryStatus.GO_TO_DESTINATION, DeliveryStatus.RETURN_HOME}:
+                if delivery.status not in {DeliveryStatus.GO_TO_SOURCE, DeliveryStatus.AT_SOURCE, DeliveryStatus.GO_TO_DESTINATION, DeliveryStatus.RETURN_HOME}:
                     raise InvalidTransitionError(f"Cannot cancel delivery in state {delivery.status.value}")
                 goal_id = delivery.nav_goal_id
                 await self._transition(
@@ -173,7 +197,10 @@ class DeliveryStateMachine:
                 if delivery.status != expected or delivery.nav_goal_id != goal_id:
                     return delivery
                 if result.status == GoalStatus.SUCCEEDED:
-                    if expected == DeliveryStatus.GO_TO_DESTINATION:
+                    if expected == DeliveryStatus.GO_TO_SOURCE:
+                        await self._transition(db, delivery, DeliveryStatus.AT_SOURCE, actor_id,
+                                               "pickup location reached; awaiting package loading confirmation")
+                    elif expected == DeliveryStatus.GO_TO_DESTINATION:
                         await self._transition(db, delivery, DeliveryStatus.ARRIVED, actor_id,
                                                "navigation succeeded")
                     else:
@@ -205,7 +232,24 @@ class DeliveryStateMachine:
         result = await db.execute(select(Destination).where(Destination.id == destination_id))
         return result.scalar_one_or_none()
 
-    async def _transition(self, db: AsyncSession, delivery: Delivery,
+    @staticmethod
+    async def record_source_receipt(db: AsyncSession, delivery: Delivery, user_id: str) -> None:
+        """Record receipt without constructing or invoking a navigation adapter.
+
+        Caller must hold the delivery row lock and commit the transaction.
+        """
+        if not delivery.source_id or delivery.status != DeliveryStatus.ARRIVED:
+            raise InvalidTransitionError("Package receipt requires a source-based delivery in ARRIVED")
+        delivery.delivered_at = _utcnow()
+        delivery.completed_at = delivery.delivered_at
+        await DeliveryStateMachine._transition(db, delivery, DeliveryStatus.DELIVERED, user_id,
+                                               "package receipt confirmed at destination")
+        await log_event(db, type="delivery.pickup_confirmed", severity=EventSeverity.INFO,
+                        robot_id=str(delivery.robot_id), user_id=user_id,
+                        payload={"delivery_id": str(delivery.id)})
+
+    @staticmethod
+    async def _transition(db: AsyncSession, delivery: Delivery,
                           new_state: DeliveryStatus, actor_id: str | None,
                           reason: str, *, goal_id: str | None = None) -> None:
         previous = delivery.status
