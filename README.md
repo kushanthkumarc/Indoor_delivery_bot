@@ -2,6 +2,9 @@
 
 FastAPI + MySQL + Redis backend for the Autonomous Indoor Delivery Robot system.
 
+For Render (including Free-plan migrations and hosted demo fixtures), see
+[Render deployment and demo data](docs/RENDER_DEMO_DEPLOYMENT.md).
+
 See `.kiro/specs/indoor-delivery-robot-backend/` for the full requirements, design, and task breakdown.
 
 ## Local development
