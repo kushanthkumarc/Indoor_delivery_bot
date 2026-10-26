@@ -103,7 +103,7 @@ class Nav2Bridge(ABC):
     """
     Abstract interface for the Nav2 navigation bridge.
 
-    Both the real rosbridge transport and the simulation mock implement
+Navigation transports implement
     this interface so that all business logic is transport-agnostic.
 
     Requirements: 6.1, 6.2

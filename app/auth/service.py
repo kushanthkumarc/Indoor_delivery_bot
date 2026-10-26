@@ -11,13 +11,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Event, EventSeverity, User, UserRole
+from app.core.config import settings
 
 # Redis key prefixes
 _BLACKLIST_PREFIX = "auth:blacklist:"
+_SESSION_REVOKED_PREFIX = "auth:session-revoked:"
 _RATE_LIMIT_PREFIX = "auth:rate:"
 
-_MAX_LOGIN_ATTEMPTS = 5
-_RATE_LIMIT_WINDOW_S = 15 * 60  # 15 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +76,16 @@ async def is_blacklisted(redis: Redis, jti: str) -> bool:
     return await redis.exists(key) == 1
 
 
+async def is_session_revoked(redis: Redis, session_id: str) -> bool:
+    """Check a login-session revocation marker; fail closed if Redis is unavailable."""
+    return await redis.exists(f"{_SESSION_REVOKED_PREFIX}{session_id}") == 1
+
+
+async def revoke_session(redis: Redis, session_id: str, ttl_seconds: int) -> None:
+    """Revoke all access/refresh credentials carrying this session ID."""
+    await redis.setex(f"{_SESSION_REVOKED_PREFIX}{session_id}", max(ttl_seconds, 1), "1")
+
+
 # ---------------------------------------------------------------------------
 # Login rate limiter  (Requirement 1.8 — 5 attempts per 15 min per IP)
 # ---------------------------------------------------------------------------
@@ -102,17 +112,12 @@ async def check_rate_limit(redis: Redis, ip: str) -> bool:
         )
         raise
     except (redis_async.exceptions.ConnectionError, redis_async.exceptions.TimeoutError) as e:
-        logger.error(
-            "Redis unreachable (%s: %s). Common causes: "
-            "(1) REDIS_URL uses redis:// but provider requires rediss:// (TLS); "
-            "(2) wrong host/port; (3) firewall blocking outbound to Redis; "
-            "(4) idle connection drop on the server side.",
-            type(e).__name__, e,
-        )
+        logger.error("Redis unreachable (%s); verify TLS scheme, host, firewall, and provider availability",
+                     type(e).__name__)
         raise
     if count == 1:
-        await redis.expire(key, _RATE_LIMIT_WINDOW_S)
-    return count <= _MAX_LOGIN_ATTEMPTS
+        await redis.expire(key, settings.AUTH_RATE_LIMIT_WINDOW_S)
+    return count <= settings.AUTH_RATE_LIMIT_MAX_ATTEMPTS
 
 
 async def get_rate_limit_ttl(redis: Redis, ip: str) -> int:
@@ -146,12 +151,10 @@ async def register_user(
     """
     Create a new user account via self-registration.
 
-    Bootstrap rule:
-      - If no active ADMIN exists yet, the new user is created as role=ADMIN.
-      - Otherwise the new user is created as role=USER.
+    Public registration always creates a USER. The first administrator is
+    provisioned from trusted startup environment settings, never by a public request.
 
-    Returns (user, became_admin) where `became_admin` is True only if the new
-    user was the first-ever active admin (this is mainly for logging).
+    Returns (user, False) to retain the legacy return shape for callers.
 
     Raises ValueError if the email is already registered.
     """
@@ -159,8 +162,7 @@ async def register_user(
     if existing.scalar_one_or_none() is not None:
         raise ValueError("email already registered")
 
-    became_admin = (await count_active_admins(db)) == 0
-    role = UserRole.ADMIN if became_admin else UserRole.USER
+    role = UserRole.USER
 
     user = User(
         email=email,
@@ -173,7 +175,7 @@ async def register_user(
     await db.flush()
 
     event = Event(
-        type="auth.bootstrap_admin" if became_admin else "auth.register",
+        type="auth.register",
         severity=EventSeverity.INFO,
         user_id=str(user.id),
         payload_json={"email": email, "role": role.value},
@@ -181,4 +183,4 @@ async def register_user(
     db.add(event)
     await db.flush()
 
-    return user, became_admin
+    return user, False

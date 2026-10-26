@@ -41,6 +41,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Return a timezone-aware UTC datetime from a persisted or parsed value."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _robot_to_dict(robot: Robot) -> dict[str, Any]:
     """Serialise a Robot ORM instance to a plain dict for WS / REST responses."""
     return {
@@ -69,6 +76,9 @@ class RobotStatusService:
         # hub is DashboardWSHub — typed as Any to avoid circular import at module level
         self._hub = hub
         self._monitor_task: asyncio.Task | None = None
+        self._gateway_connected: dict[str, str] = {}
+        self._gateway_lock = asyncio.Lock()
+        self._broadcasted_freshness: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Heartbeat
@@ -102,8 +112,88 @@ class RobotStatusService:
             await db.commit()
             await db.refresh(robot)
 
+            freshness = self.connection_freshness(robot_id, robot.last_seen)
+            await self._broadcast_freshness(robot_id, freshness, robot.last_seen)
+
             if was_offline:
                 await self._hub.broadcast("robot.online", _robot_to_dict(robot))
+
+    async def gateway_connected(self, robot_id: str, connection_id: str) -> bool:
+        """Record an authenticated gateway connection; heartbeat is still required."""
+        async with self._gateway_lock:
+            if robot_id in self._gateway_connected:
+                return False
+            self._gateway_connected[robot_id] = connection_id
+        await self._broadcast_freshness(robot_id, "STALE", None)
+        return True
+
+    async def gateway_disconnected(self, robot_id: str, connection_id: str) -> None:
+        """Mark the transport offline after its authenticated socket closes."""
+        async with self._gateway_lock:
+            if self._gateway_connected.get(robot_id) != connection_id:
+                return
+            self._gateway_connected.pop(robot_id, None)
+        self._broadcasted_freshness.pop(robot_id, None)
+        async with AsyncSessionLocal() as db:
+            robot = await _get_robot(db, robot_id)
+            if robot is not None and robot.status != RobotStatus.OFFLINE:
+                robot.status = RobotStatus.OFFLINE
+                await db.commit()
+        await self._hub.broadcast(
+            "robot.offline", {"robot_id": robot_id, "connection_state": "OFFLINE"}
+        )
+
+    async def _broadcast_freshness(self, robot_id: str, state: str,
+                                   last_seen: datetime | None) -> None:
+        if self._broadcasted_freshness.get(robot_id) == state:
+            return
+        self._broadcasted_freshness[robot_id] = state
+        await self._hub.broadcast("robot.freshness", {
+            "robot_id": robot_id,
+            "connection_state": state,
+            "last_seen": last_seen.isoformat() if last_seen else None,
+        })
+
+    def connection_freshness(self, robot_id: str, last_seen: datetime | None,
+                             now: datetime | None = None) -> str:
+        """Derive ONLINE/STALE/OFFLINE without changing the legacy DB enum."""
+        if robot_id not in self._gateway_connected:
+            return "OFFLINE"
+        if last_seen is None:
+            return "STALE"
+        now = now or _utcnow()
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        age = max(0.0, (now - last_seen).total_seconds())
+        if age > settings.HEARTBEAT_TIMEOUT_S:
+            return "OFFLINE"
+        if age > settings.ROBOT_STALE_AFTER_S:
+            return "STALE"
+        return "ONLINE"
+
+    async def update_gateway_telemetry(self, robot_id: str, payload: dict[str, Any]) -> None:
+        """Refresh freshness and mirror only fields represented by existing models."""
+        await self.update_heartbeat(robot_id)
+        mode = payload.get("mode")
+        if mode is not None:
+            await self.update_control_mode(robot_id, ControlMode(mode))
+        safety = payload.get("safety_state")
+        if safety is not None:
+            await self.update_safety_state(robot_id, SafetyState(safety))
+        pose = payload.get("pose")
+        if pose is not None:
+            await self.update_pose(robot_id, pose["x"], pose["y"], pose["theta"])
+        battery = payload.get("battery_level")
+        if battery is not None:
+            async with AsyncSessionLocal() as db:
+                robot = await _get_robot(db, robot_id)
+                if robot is not None:
+                    robot.battery_level = battery
+                    await db.commit()
+        # Preserve all supplied values (and absent/unknown fields) for dashboards.
+        await self._hub.broadcast(
+            "robot.telemetry", {"robot_id": robot_id, **payload}
+        )
 
     # ------------------------------------------------------------------
     # Field updates
@@ -173,7 +263,9 @@ class RobotStatusService:
             robot = result.scalar_one_or_none()
             if robot is None:
                 return {}
-            return _robot_to_dict(robot)
+            snapshot = _robot_to_dict(robot)
+            snapshot["connection_state"] = self.connection_freshness(str(robot.id), robot.last_seen)
+            return snapshot
 
     # ------------------------------------------------------------------
     # Background heartbeat timeout monitor
@@ -207,17 +299,23 @@ class RobotStatusService:
 
             for robot in online_robots:
                 timed_out = False
+                last_seen = _as_utc(robot.last_seen) if robot.last_seen else None
 
                 # Check Redis key first (fast path)
                 key = f"{_HEARTBEAT_KEY_PREFIX}{robot.id}"
                 last_seen_str: str | None = await redis.get(key)
 
                 if last_seen_str is None:
-                    # Key expired — rely on DB last_seen
-                    timed_out = True
+                    # Redis can be unavailable/expired before the DB timeout.
+                    # DB last_seen is authoritative for the timeout boundary.
+                    timed_out = bool(
+                        last_seen is None
+                        or (now - last_seen).total_seconds()
+                        > _HEARTBEAT_TIMEOUT_S
+                    )
                 else:
                     try:
-                        last_seen_dt = datetime.fromisoformat(last_seen_str)
+                        last_seen_dt = _as_utc(datetime.fromisoformat(last_seen_str))
                         elapsed = (now - last_seen_dt).total_seconds()
                         if elapsed > _HEARTBEAT_TIMEOUT_S:
                             timed_out = True
@@ -225,8 +323,8 @@ class RobotStatusService:
                         timed_out = True
 
                 # Also check DB last_seen as a fallback
-                if not timed_out and robot.last_seen:
-                    elapsed_db = (now - robot.last_seen).total_seconds()
+                if not timed_out and last_seen:
+                    elapsed_db = (now - last_seen).total_seconds()
                     if elapsed_db > _HEARTBEAT_TIMEOUT_S:
                         timed_out = True
 
@@ -248,6 +346,10 @@ class RobotStatusService:
                         "robot.offline",
                         {"robot_id": str(robot.id), "last_seen": robot.last_seen.isoformat() if robot.last_seen else None},
                     )
+                    await self._broadcast_freshness(str(robot.id), "OFFLINE", robot.last_seen)
+                elif robot.last_seen:
+                    freshness = self.connection_freshness(str(robot.id), robot.last_seen, now)
+                    await self._broadcast_freshness(str(robot.id), freshness, robot.last_seen)
 
     def start_monitor(self) -> None:
         """Schedule the heartbeat timeout monitor as an asyncio background task."""

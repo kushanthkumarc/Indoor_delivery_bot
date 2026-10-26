@@ -1,30 +1,34 @@
-"""
-Delivery State Machine — Module 4.1
-
-Manages the lifecycle of a delivery.
-Requirements: 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9
-"""
+"""Transactional delivery lifecycle using an injected navigation adapter."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Callable, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.db.models import Delivery, DeliveryStatus, EventSeverity
+from app.db.models import (
+    ControlMode, Delivery, DeliveryStatus, Destination, EventSeverity,
+    MappingSession, MappingSessionStatus, Robot, RobotStatus, SafetyState,
+)
 from app.db.session import AsyncSessionLocal
 from app.events.service import log_event
-from app.nav2.bridge import GoalResult, GoalStatus, Nav2Bridge, Pose
+from app.nav2.bridge import GoalResult, GoalStatus, Pose
 
 logger = logging.getLogger(__name__)
 
 
 class InvalidTransitionError(Exception):
-    """Raised when an invalid state transition is attempted."""
-    pass
+    """Raised when a delivery state transition is not allowed."""
+
+
+class NavigationAdapter(Protocol):
+    async def start(self, pose: Pose, delivery_id: str) -> str: ...
+    async def wait_result(self, goal_id: str) -> GoalResult: ...
+    async def cancel(self, goal_id: str) -> None: ...
 
 
 def _utcnow() -> datetime:
@@ -32,160 +36,235 @@ def _utcnow() -> datetime:
 
 
 class DeliveryStateMachine:
-    """
-    State machine for an autonomous delivery.
-    
-    States: IDLE -> GO_TO_DESTINATION -> ARRIVED -> DELIVERED -> RETURN_HOME -> HOME -> IDLE
-    """
-    
-    def __init__(self, nav2_bridge: Nav2Bridge) -> None:
-        self._bridge = nav2_bridge
-    
-    async def dispatch(self, delivery_id: str) -> None:
-        """
-        Transition IDLE -> GO_TO_DESTINATION and trigger Nav2 goal.
-        Requirement 5.2
-        """
-        async with AsyncSessionLocal() as db:
-            delivery = await self._get_delivery(db, delivery_id)
-            if not delivery:
-                raise ValueError(f"Delivery {delivery_id} not found")
-                
-            if delivery.status != DeliveryStatus.IDLE:
-                raise InvalidTransitionError(f"Cannot dispatch delivery in state {delivery.status}")
-                
-            # Get destination pose (requires joining destination or fetching it)
-            await db.refresh(delivery, ["destination"])
-            dest = delivery.destination
-            
-            nav_pose = Pose(x=dest.x, y=dest.y, theta=dest.theta)
-            
-            # Record transition and update status BEFORE sending goal to avoid race conditions
-            self._record_transition(delivery, DeliveryStatus.IDLE, DeliveryStatus.GO_TO_DESTINATION)
-            delivery.status = DeliveryStatus.GO_TO_DESTINATION
-            
-            # Send nav goal
-            goal_id = await self._bridge.send_goal(nav_pose, delivery_id)
-            delivery.nav_goal_id = goal_id
-            
-            await db.commit()
-            
-            logger.info("Delivery %s dispatched. Nav goal: %s", delivery_id, goal_id)
-            
-    async def on_pickup_confirmed(self, delivery_id: str, user_id: str) -> None:
-        """
-        Transition ARRIVED -> DELIVERED -> RETURN_HOME and trigger return Nav2 goal.
-        Requirement 5.4, 5.5
-        """
-        async with AsyncSessionLocal() as db:
-            delivery = await self._get_delivery(db, delivery_id)
-            if not delivery:
-                raise ValueError(f"Delivery {delivery_id} not found")
-                
-            if delivery.status != DeliveryStatus.ARRIVED:
-                raise InvalidTransitionError(f"Cannot confirm pickup in state {delivery.status}")
-                
-            self._record_transition(delivery, DeliveryStatus.ARRIVED, DeliveryStatus.DELIVERED)
-            delivery.delivered_at = _utcnow()
-            
-            # Trigger log event for pickup
-            await log_event(
-                db, 
-                type="delivery.pickup_confirmed", 
-                severity=EventSeverity.INFO, 
-                robot_id=str(delivery.robot_id),
-                user_id=user_id,
-                payload={"delivery_id": delivery_id}
+    """State transitions are committed before awaiting navigation results."""
+
+    def __init__(self, navigation: NavigationAdapter,
+                 freshness_check: Callable[[str, datetime | None], str] | None = None) -> None:
+        self._navigation = navigation
+        self._freshness_check = freshness_check
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, delivery_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(delivery_id, asyncio.Lock())
+
+    async def dispatch(self, delivery_id: str, actor_id: str | None = None,
+                       *, loading_confirmed: bool = False) -> Delivery:
+        async with self._lock_for(delivery_id):
+            async with AsyncSessionLocal() as db:
+                delivery = await self._get_delivery(db, delivery_id, lock=True)
+                if delivery is None:
+                    raise ValueError("Delivery not found")
+                expected = DeliveryStatus.GO_TO_DESTINATION if loading_confirmed or not delivery.source_id else DeliveryStatus.GO_TO_SOURCE
+                required = DeliveryStatus.AT_SOURCE if loading_confirmed else DeliveryStatus.IDLE
+                if delivery.status == expected and delivery.nav_goal_id:
+                    return delivery
+                if delivery.status != required or (loading_confirmed and not delivery.source_id):
+                    raise InvalidTransitionError(f"Cannot dispatch delivery in state {delivery.status.value}")
+                destination = await self._get_destination(db, delivery.destination_id)
+                if destination is None:
+                    raise ValueError("Destination not found")
+                robot_result = await db.execute(
+                    select(Robot).where(Robot.id == delivery.robot_id).with_for_update()
+                )
+                robot = robot_result.scalar_one_or_none()
+                if robot is None:
+                    raise ValueError("Delivery robot not found")
+                if robot.status != RobotStatus.ONLINE:
+                    raise InvalidTransitionError("Cannot dispatch while robot is offline")
+                if robot.control_mode != ControlMode.AUTONOMOUS:
+                    raise InvalidTransitionError("Cannot dispatch unless robot is AUTONOMOUS")
+                if robot.safety_state != SafetyState.SAFE:
+                    raise InvalidTransitionError("Cannot dispatch unless robot safety state is SAFE")
+                busy = await db.execute(select(Delivery.id).where(
+                    Delivery.robot_id == delivery.robot_id, Delivery.id != delivery.id,
+                    Delivery.status.in_([DeliveryStatus.GO_TO_SOURCE, DeliveryStatus.AT_SOURCE,
+                        DeliveryStatus.GO_TO_DESTINATION, DeliveryStatus.ARRIVED, DeliveryStatus.RETURN_HOME,
+                        DeliveryStatus.EMERGENCY_STOP])
+                ).limit(1))
+                if busy.first() is not None:
+                    raise InvalidTransitionError("Robot is busy with another delivery")
+                if self._freshness_check and self._freshness_check(str(robot.id), robot.last_seen) != "ONLINE":
+                    raise InvalidTransitionError("Cannot dispatch while robot gateway telemetry is stale or offline")
+                map_result = await db.execute(select(MappingSession).where(
+                    MappingSession.id == destination.map_id,
+                    MappingSession.robot_id == delivery.robot_id,
+                    MappingSession.status == MappingSessionStatus.FINISHED,
+                ))
+                if map_result.scalar_one_or_none() is None:
+                    raise InvalidTransitionError("Destination map is not a finished map for this robot")
+                target = destination
+                if delivery.source_id:
+                    source = await self._get_destination(db, delivery.source_id)
+                    if source is None or source.map_id != destination.map_id or source.id == destination.id:
+                        raise InvalidTransitionError("Pickup and destination must be distinct locations on the same finished map")
+                    if not loading_confirmed:
+                        target = source
+                goal_id = await self._navigation.start(
+                    Pose(target.x, target.y, target.theta), delivery_id
+                )
+                try:
+                    await self._transition(
+                        db, delivery, expected, actor_id,
+                        "package loading confirmed" if loading_confirmed else "dispatch requested", goal_id=goal_id,
+                    )
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    await self._navigation.cancel(goal_id)
+                    raise
+        return await self._await_navigation(delivery_id, goal_id, expected, actor_id)
+
+    async def on_pickup_confirmed(self, delivery_id: str, user_id: str) -> Delivery:
+        async with self._lock_for(delivery_id):
+            async with AsyncSessionLocal() as db:
+                delivery = await self._get_delivery(db, delivery_id, lock=True)
+                if delivery is None:
+                    raise ValueError("Delivery not found")
+                if delivery.status != DeliveryStatus.ARRIVED:
+                    raise InvalidTransitionError(f"Cannot confirm pickup in state {delivery.status.value}")
+                if delivery.source_id:
+                    # Explicit source-to-destination requests finish on receipt.
+                    # No return journey is implied by confirming the package.
+                    await self.record_source_receipt(db, delivery, user_id)
+                    await db.commit()
+                    return delivery
+                destination = await self._get_destination(db, delivery.destination_id)
+                if destination is None:
+                    raise ValueError("Destination not found")
+                homes_result = await db.execute(select(Destination).where(
+                    Destination.map_id == destination.map_id, Destination.is_home.is_(True)
+                ))
+                home = homes_result.scalars().first()
+                if home is None:
+                    raise ValueError("Home destination not configured for delivery map")
+                goal_id = await self._navigation.start(Pose(home.x, home.y, home.theta), delivery_id)
+                delivery.delivered_at = _utcnow()
+                try:
+                    await self._transition(
+                        db, delivery, DeliveryStatus.DELIVERED, user_id,
+                        "pickup confirmed",
+                    )
+                    await log_event(db, type="delivery.pickup_confirmed", severity=EventSeverity.INFO,
+                                    robot_id=str(delivery.robot_id), user_id=user_id,
+                                    payload={"delivery_id": delivery_id})
+                    await self._transition(
+                        db, delivery, DeliveryStatus.RETURN_HOME, user_id,
+                        "return to configured Home destination", goal_id=goal_id,
+                    )
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    await self._navigation.cancel(goal_id)
+                    raise
+        return await self._await_navigation(delivery_id, goal_id, DeliveryStatus.RETURN_HOME, user_id)
+
+    async def cancel(self, delivery_id: str, actor_id: str) -> Delivery:
+        async with self._lock_for(delivery_id):
+            async with AsyncSessionLocal() as db:
+                delivery = await self._get_delivery(db, delivery_id, lock=True)
+                if delivery is None:
+                    raise ValueError("Delivery not found")
+                if delivery.status == DeliveryStatus.EMERGENCY_STOP:
+                    return delivery
+                if delivery.status not in {DeliveryStatus.GO_TO_SOURCE, DeliveryStatus.AT_SOURCE, DeliveryStatus.GO_TO_DESTINATION, DeliveryStatus.RETURN_HOME}:
+                    raise InvalidTransitionError(f"Cannot cancel delivery in state {delivery.status.value}")
+                goal_id = delivery.nav_goal_id
+                await self._transition(
+                    db, delivery, DeliveryStatus.EMERGENCY_STOP, actor_id,
+                    "cancellation requested; physical stop unconfirmed",
+                )
+                await db.commit()
+        if goal_id:
+            await self._navigation.cancel(goal_id)
+        return delivery
+
+    async def _await_navigation(self, delivery_id: str, goal_id: str,
+                                expected: DeliveryStatus, actor_id: str | None) -> Delivery:
+        try:
+            result = await asyncio.wait_for(
+                self._navigation.wait_result(goal_id), timeout=settings.DELIVERY_STATE_TIMEOUT_S
             )
-            
-            # Now transition to RETURN_HOME
-            self._record_transition(delivery, DeliveryStatus.DELIVERED, DeliveryStatus.RETURN_HOME)
-            delivery.status = DeliveryStatus.RETURN_HOME
-            
-            # Note: A real app would get the "Home" destination pose for this map.
-            # Assuming origin for now as a fallback.
-            nav_pose = Pose(x=0.0, y=0.0, theta=0.0)
-            
-            goal_id = await self._bridge.send_goal(nav_pose, delivery_id)
-            delivery.nav_goal_id = goal_id
-            
-            await db.commit()
-            logger.info("Delivery %s pickup confirmed. Returning home. Nav goal: %s", delivery_id, goal_id)
-
-    async def on_emergency_stop(self, delivery_id: str, reason: str = "") -> None:
-        """
-        Transition any state -> EMERGENCY_STOP.
-        Requirement 5.7
-        """
-        async with AsyncSessionLocal() as db:
-            delivery = await self._get_delivery(db, delivery_id)
-            if not delivery:
-                return
-                
-            old_status = delivery.status
-            if old_status == DeliveryStatus.EMERGENCY_STOP:
-                return
-                
-            self._record_transition(delivery, old_status, DeliveryStatus.EMERGENCY_STOP)
-            delivery.status = DeliveryStatus.EMERGENCY_STOP
-            
-            await db.commit()
-            logger.warning("Delivery %s transitioned to EMERGENCY_STOP", delivery_id)
-            
-    async def on_nav_result(self, delivery_id: str, result: GoalResult) -> None:
-        """
-        Handle a navigation result callback from the goal tracker.
-        Advances state based on current state and goal outcome.
-        Requirement 5.3, 5.6
-        """
-        if not delivery_id:
-            return
-            
-        async with AsyncSessionLocal() as db:
-            delivery = await self._get_delivery(db, delivery_id)
-            if not delivery:
-                return
-                
-            # If goal failed or cancelled, trigger emergency/error state
-            if result.status in (GoalStatus.FAILED, GoalStatus.CANCELLED):
-                logger.error("Delivery %s nav goal failed/cancelled", delivery_id)
-                old_status = delivery.status
-                self._record_transition(delivery, old_status, DeliveryStatus.EMERGENCY_STOP)
-                delivery.status = DeliveryStatus.EMERGENCY_STOP
+        except asyncio.TimeoutError:
+            await self._navigation.cancel(goal_id)
+            result = GoalResult(goal_id=goal_id, status=GoalStatus.FAILED,
+                                failure_reason="Navigation result timed out")
+        async with self._lock_for(delivery_id):
+            async with AsyncSessionLocal() as db:
+                delivery = await self._get_delivery(db, delivery_id, lock=True)
+                if delivery is None:
+                    raise ValueError("Delivery not found")
+                # Ignore late navigation completions after cancellation or a newer goal.
+                if delivery.status != expected or delivery.nav_goal_id != goal_id:
+                    return delivery
+                if result.status == GoalStatus.SUCCEEDED:
+                    if expected == DeliveryStatus.GO_TO_SOURCE:
+                        await self._transition(db, delivery, DeliveryStatus.AT_SOURCE, actor_id,
+                                               "pickup location reached; awaiting package loading confirmation")
+                    elif expected == DeliveryStatus.GO_TO_DESTINATION:
+                        await self._transition(db, delivery, DeliveryStatus.ARRIVED, actor_id,
+                                               "navigation succeeded")
+                    else:
+                        await self._transition(db, delivery, DeliveryStatus.HOME, actor_id,
+                                               "return navigation succeeded")
+                        await self._transition(db, delivery, DeliveryStatus.IDLE, actor_id,
+                                               "delivery lifecycle completed")
+                        delivery.completed_at = _utcnow()
+                else:
+                    # Existing EMERGENCY_STOP is the state machine's fail-closed,
+                    # operator-review state; it does not claim physical stop confirmation.
+                    await self._transition(
+                        db, delivery, DeliveryStatus.EMERGENCY_STOP, actor_id,
+                        "navigation failed; physical execution unconfirmed: "
+                        f"{result.failure_reason or result.status.value}",
+                    )
                 await db.commit()
-                return
+                return delivery
 
-            # Note: Goal is SUCCEEDED
-            if delivery.status == DeliveryStatus.GO_TO_DESTINATION:
-                # Arrived at destination
-                self._record_transition(delivery, DeliveryStatus.GO_TO_DESTINATION, DeliveryStatus.ARRIVED)
-                delivery.status = DeliveryStatus.ARRIVED
-                await db.commit()
-                logger.info("Delivery %s arrived at destination", delivery_id)
-                
-            elif delivery.status == DeliveryStatus.RETURN_HOME:
-                # Arrived back home
-                self._record_transition(delivery, DeliveryStatus.RETURN_HOME, DeliveryStatus.HOME)
-                self._record_transition(delivery, DeliveryStatus.HOME, DeliveryStatus.IDLE)
-                delivery.status = DeliveryStatus.IDLE
-                delivery.completed_at = _utcnow()
-                await db.commit()
-                logger.info("Delivery %s completed and robot is IDLE", delivery_id)
+    async def _get_delivery(self, db: AsyncSession, delivery_id: str,
+                            *, lock: bool = False) -> Delivery | None:
+        stmt = select(Delivery).where(Delivery.id == delivery_id)
+        if lock:
+            stmt = stmt.with_for_update()
+        result = await db.execute(stmt)
+        return result.scalar_one_or_none()
 
-    async def _get_delivery(self, db: AsyncSession, delivery_id: str) -> Delivery | None:
-        res = await db.execute(select(Delivery).where(Delivery.id == delivery_id))
-        return res.scalar_one_or_none()
-        
-    def _record_transition(self, delivery: Delivery, from_state: DeliveryStatus, to_state: DeliveryStatus) -> None:
+    async def _get_destination(self, db: AsyncSession, destination_id: str) -> Destination | None:
+        result = await db.execute(select(Destination).where(Destination.id == destination_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def record_source_receipt(db: AsyncSession, delivery: Delivery, user_id: str) -> None:
+        """Record receipt without constructing or invoking a navigation adapter.
+
+        Caller must hold the delivery row lock and commit the transaction.
         """
-        Records the transition in the history json.
-        Requirement 5.8
-        """
-        # Ensure we are working with a new list object so SQLAlchemy detects the mutation
-        history = list(delivery.state_history_json) if delivery.state_history_json else []
-        history.append({
-            "from": from_state.value,
-            "to": to_state.value,
-            "timestamp": _utcnow().isoformat()
-        })
+        if not delivery.source_id or delivery.status != DeliveryStatus.ARRIVED:
+            raise InvalidTransitionError("Package receipt requires a source-based delivery in ARRIVED")
+        delivery.delivered_at = _utcnow()
+        delivery.completed_at = delivery.delivered_at
+        await DeliveryStateMachine._transition(db, delivery, DeliveryStatus.DELIVERED, user_id,
+                                               "package receipt confirmed at destination")
+        await log_event(db, type="delivery.pickup_confirmed", severity=EventSeverity.INFO,
+                        robot_id=str(delivery.robot_id), user_id=user_id,
+                        payload={"delivery_id": str(delivery.id)})
+
+    @staticmethod
+    async def _transition(db: AsyncSession, delivery: Delivery,
+                          new_state: DeliveryStatus, actor_id: str | None,
+                          reason: str, *, goal_id: str | None = None) -> None:
+        previous = delivery.status
+        at = _utcnow()
+        history = list(delivery.state_history_json or [])
+        entry = {"from": previous.value, "to": new_state.value,
+                 "timestamp": at.isoformat(), "actor_id": actor_id, "reason": reason}
+        history.append(entry)
         delivery.state_history_json = history
+        delivery.status = new_state
+        if goal_id is not None:
+            delivery.nav_goal_id = goal_id
+        await log_event(
+            db, type="delivery.state_transition",
+            severity=EventSeverity.WARN if new_state == DeliveryStatus.EMERGENCY_STOP else EventSeverity.INFO,
+            robot_id=str(delivery.robot_id), user_id=actor_id,
+            payload={"delivery_id": str(delivery.id), **entry},
+        )

@@ -10,10 +10,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import require_role
-from app.db.models import Destination, User, UserRole
+from app.auth.dependencies import get_current_user, require_role
+from app.db.models import Destination, MappingSession, User, UserRole, UserRobotAccess
 from app.db.session import get_db
 from app.destinations.service import (
     ActiveDeliveryError,
@@ -47,6 +48,7 @@ class DestinationResponse(BaseModel):
     y: float
     theta: float
     map_id: str
+    robot_id: str | None = None
     is_home: bool
     created_at: str
     updated_at: str
@@ -129,14 +131,25 @@ async def create(
 @router.get("", response_model=list[DestinationResponse])
 async def list_all(
     db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
     map_id: str | None = Query(default=None),
-    current_user: User = _admin,
 ) -> list[DestinationResponse]:
     """
     List all destinations, optionally filtered by map_id (Requirement 4.5).
     """
-    destinations = await list_destinations(db, map_id=map_id)
-    return [DestinationResponse.from_orm(d) for d in destinations]
+    robot_ids: list[str] | None = None
+    if current_user.role != UserRole.ADMIN:
+        access_result = await db.execute(
+            select(UserRobotAccess.robot_id).where(
+                UserRobotAccess.user_id == str(current_user.id)
+            )
+        )
+        robot_ids = [str(robot_id) for robot_id in access_result.scalars().all()]
+    destinations = await list_destinations(db, map_id=map_id, robot_ids=robot_ids)
+    map_ids = {d.map_id for d in destinations}
+    maps = (await db.execute(select(MappingSession).where(MappingSession.id.in_(map_ids)))).scalars().all() if map_ids else []
+    robots_by_map = {str(m.id): str(m.robot_id) for m in maps}
+    return [DestinationResponse.from_orm(d).model_copy(update={"robot_id": robots_by_map.get(str(d.map_id))}) for d in destinations]
 
 
 @router.get("/{destination_id}", response_model=DestinationResponse)

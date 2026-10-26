@@ -9,24 +9,34 @@ DELETE /admin/users/:id   — soft-delete (Requirement 1.12)
 All routes require ADMIN JWT (Requirement 1.7).
 """
 
+import secrets
+from urllib.parse import urlsplit
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel, EmailStr
+import bcrypt
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.auth.dependencies import require_role
 from app.auth.service import hash_password
+from app.core.config import settings
 from app.db.models import (
     Event,
     EventSeverity,
     Robot,
+    RobotStatus,
+    ControlMode,
+    SafetyState,
+    SlamState,
     User,
     UserRole,
     UserRobotAccess,
 )
 from app.db.session import get_db
+from app.rosbridge.connection import rosbridge_url
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -58,6 +68,129 @@ class UserResponse(BaseModel):
     is_active: bool
 
     model_config = {"from_attributes": True}
+
+
+class CreateRobotRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Robot name must not be blank")
+        return value
+
+
+class ProvisionedRobotResponse(BaseModel):
+    id: str
+    name: str
+    status: str
+    created_at: str
+
+
+class RobotConnectionRequest(BaseModel):
+    robot_ip: str = Field(min_length=7, max_length=15)
+    port: int = Field(ge=1, le=65535, strict=True)
+
+    @field_validator("robot_ip")
+    @classmethod
+    def validate_robot_ip(cls, value: str) -> str:
+        try:
+            # Validate by constructing the exact endpoint; only the host portion
+            # is returned to the model, and no URL/path can be supplied.
+            rosbridge_url(value, 9090)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        import ipaddress
+        return str(ipaddress.IPv4Address(value.strip()))
+
+
+class RobotConnectionResponse(BaseModel):
+    enabled: bool
+    state: str
+    robot_ip: str | None = None
+    port: int | None = None
+
+
+@router.get("/robot-connection", response_model=RobotConnectionResponse)
+async def get_robot_connection(
+    request: Request,
+    _admin: User = _require_admin,
+) -> RobotConnectionResponse:
+    """Report local ROSBridge state without exposing a URL or credentials."""
+    enabled = settings.ROSBRIDGE_ENABLED and settings.APP_ENV.strip().lower() == "development"
+    client = getattr(request.app.state, "rosbridge_client", None)
+    if not enabled:
+        return RobotConnectionResponse(enabled=False, state="DISABLED")
+    if client is None:
+        return RobotConnectionResponse(enabled=True, state="DISCONNECTED")
+
+    try:
+        parsed = urlsplit(client.url)
+        robot_ip, port = parsed.hostname, parsed.port
+    except ValueError:
+        robot_ip, port = None, None
+    task = getattr(client, "_reconnect_task", None)
+    state_name = (
+        "CONNECTED" if client.connected else
+        "CONNECTING" if client.connecting else
+        "RETRYING" if task is not None and not task.done() else
+        "DISCONNECTED"
+    )
+    return RobotConnectionResponse(
+        enabled=True,
+        state=state_name,
+        robot_ip=robot_ip,
+        port=port,
+    )
+
+
+@router.post("/robot-connection", response_model=RobotConnectionResponse)
+async def connect_robot_bridge(
+    body: RobotConnectionRequest,
+    request: Request,
+    _admin: User = _require_admin,
+) -> RobotConnectionResponse:
+    """Select a robot's ROSBridge endpoint for this local process only.
+
+    The operation is disabled unless ROS is explicitly enabled in development.
+    It never enables ROS in production or persists the address across restarts.
+    """
+    if settings.APP_ENV.strip().lower() != "development" or not settings.ROSBRIDGE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "ROSBRIDGE_DISABLED", "message": "Enable ROSBRIDGE_ENABLED in local development and restart the backend."},
+        )
+
+    endpoint = rosbridge_url(body.robot_ip, body.port)
+    lock = getattr(request.app.state, "rosbridge_connection_lock", None)
+    if lock is None:
+        import asyncio
+        lock = asyncio.Lock()
+        request.app.state.rosbridge_connection_lock = lock
+
+    async with lock:
+        previous = getattr(request.app.state, "rosbridge_client", None)
+        if previous is not None:
+            if previous.connected:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"error": "ROBOT_ALREADY_CONNECTED", "message": "Disconnect or restart the backend before changing the active robot."},
+                )
+            await previous.stop_and_wait()
+
+        from app.rosbridge.client import RosbridgeClient
+        client = RosbridgeClient(endpoint)
+        client.start()
+        request.app.state.rosbridge_client = client
+
+    return RobotConnectionResponse(
+        enabled=True,
+        state="CONNECTING",
+        robot_ip=body.robot_ip,
+        port=body.port,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +348,50 @@ async def delete_user(
 # ---------------------------------------------------------------------------
 # Robot access grants
 # ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/robots",
+    response_model=ProvisionedRobotResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_robot(
+    body: CreateRobotRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    admin: User = _require_admin,
+) -> ProvisionedRobotResponse:
+    """Provision a robot without returning its gateway credential. ADMIN-only."""
+    api_key = secrets.token_urlsafe(32)
+    api_key_hash = await run_in_threadpool(
+        lambda: bcrypt.hashpw(api_key.encode(), bcrypt.gensalt(rounds=12)).decode()
+    )
+    robot = Robot(
+        name=body.name,
+        api_key_hash=api_key_hash,
+        status=RobotStatus.OFFLINE,
+        control_mode=ControlMode.STOPPED,
+        safety_state=SafetyState.SAFE,
+        slam_state=SlamState.IDLE,
+    )
+    db.add(robot)
+    await db.flush()
+
+    # Audit only the actor and robot identity; never persist the raw key.
+    db.add(Event(
+        type="admin.robot_provisioned",
+        severity=EventSeverity.INFO,
+        robot_id=str(robot.id),
+        user_id=str(admin.id),
+        payload_json={"actor_id": str(admin.id), "robot_name": robot.name},
+    ))
+    await db.flush()
+
+    return ProvisionedRobotResponse(
+        id=str(robot.id),
+        name=robot.name,
+        status=robot.status.value,
+        created_at=robot.created_at.isoformat(),
+    )
 
 
 class RobotAccessResponse(BaseModel):

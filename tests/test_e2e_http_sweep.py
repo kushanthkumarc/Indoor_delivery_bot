@@ -1,6 +1,7 @@
 """Comprehensive end-to-end HTTP endpoint sweep for the Indoor Delivery Robot Backend."""
 import asyncio
 import json
+import os
 import sys
 import uuid
 
@@ -8,8 +9,8 @@ import aiomysql
 import httpx
 
 BASE = "http://127.0.0.1:8000"
-ADMIN_EMAIL = "admin@example.com"
-ADMIN_PASSWORD = "change-me-admin-password"
+ADMIN_EMAIL = os.environ.get("E2E_ADMIN_EMAIL", "")
+ADMIN_PASSWORD = os.environ.get("E2E_ADMIN_PASSWORD", "")
 USER_EMAIL = "testuser@example.com"
 USER_PASSWORD = "TestUser!234"
 
@@ -62,6 +63,8 @@ def H(tok: str) -> dict:
 
 
 async def main() -> int:
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        raise RuntimeError("Set E2E_ADMIN_EMAIL and E2E_ADMIN_PASSWORD for this live integration script")
     async with httpx.AsyncClient(base_url=BASE, timeout=10.0) as c:
         # Health
         r = await c.get("/health")
@@ -275,10 +278,6 @@ async def main() -> int:
             await set_robot_mode(robot_id, "ONLINE", "STOPPED")
             r = await c.post("/deliveries", json={"robot_id": robot_id, "destination_id": home_id}, headers=H(admin_access))
             record("delivery", "POST /deliveries (not autonomous) -> 409", "409", r.status_code, str(r.json().get("detail", "")))
-
-        # Simulation
-        r = await c.post("/sim/inject-fault", json={"fault": "SLAM_LOST"}, headers=H(admin_access))
-        record("simulation", "POST /sim/inject-fault (TODO)", "501", r.status_code)
 
         # ---------------------------------------------------------------
         # Self-registration (ERP-style) + Robot-access (new in this session)

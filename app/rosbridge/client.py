@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 from typing import Callable, Awaitable, Any
+from urllib.parse import urlsplit
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -26,6 +27,20 @@ logger = logging.getLogger(__name__)
 MessageHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+def _endpoint_for_log(url: str) -> str:
+    """Keep endpoint diagnostics while excluding credentials, paths, and query values."""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or "unknown"
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{parsed.scheme or 'ws'}://{host}"
+    except ValueError:
+        return "rosbridge endpoint (invalid URL)"
+
+
 class RosbridgeClient:
     """
     Persistent WebSocket client to the robot's rosbridge server.
@@ -34,17 +49,27 @@ class RosbridgeClient:
     def __init__(self, url: str | None = None) -> None:
         self.url = url or getattr(settings, "ROSBRIDGE_URL", "ws://localhost:9090")
         self._ws = None
+        self._connected = False
+        self._connecting = False
         self._handlers: list[MessageHandler] = []
         self._reconnect_task: asyncio.Task | None = None
         
         # Determine robot_id from DB or config in a real app, assuming static for now
         self.robot_id = "default-robot-id"  
         
-        logger.info("RosbridgeClient created with URL: %s", self.url)
+        logger.info("RosbridgeClient created for %s", _endpoint_for_log(self.url))
 
     def register_handler(self, handler: MessageHandler) -> None:
         """Register a callback for incoming messages."""
         self._handlers.append(handler)
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def connecting(self) -> bool:
+        return self._connecting
         
     async def send(self, message: str) -> None:
         """Send a raw JSON string to the robot."""
@@ -56,7 +81,7 @@ class RosbridgeClient:
         try:
             await self._ws.send(message)
         except Exception as e:
-            logger.error("RosbridgeClient: send failed: %s", str(e))
+            logger.error("RosbridgeClient: send failed (%s)", type(e).__name__)
 
     async def connect(self) -> None:
         """Connect to rosbridge and keep listening."""
@@ -65,10 +90,13 @@ class RosbridgeClient:
         
         while True:
             try:
-                logger.info("RosbridgeClient connecting to %s...", self.url)
+                self._connecting = True
+                logger.info("RosbridgeClient connecting to %s...", _endpoint_for_log(self.url))
                 async with websockets.connect(self.url) as ws:
                     self._ws = ws
-                    logger.info("RosbridgeClient connected to %s", self.url)
+                    self._connected = True
+                    self._connecting = False
+                    logger.info("RosbridgeClient connected to %s", _endpoint_for_log(self.url))
                     
                     # Notify safety manager (Requirement 7.6)
                     await safety_manager.on_ws_reconnect(self.robot_id)
@@ -79,11 +107,20 @@ class RosbridgeClient:
                     # Message loop
                     async for message in ws:
                         await self._route_message(message)
+
+                    self._connected = False
+                    self._ws = None
                         
             except ConnectionClosed as e:
-                logger.warning("RosbridgeClient connection closed: %s", e)
+                self._connected = False
+                self._connecting = False
+                self._ws = None
+                logger.warning("RosbridgeClient connection closed (%s)", type(e).__name__)
             except Exception as e:
-                logger.error("RosbridgeClient connection error: %s", e)
+                self._connected = False
+                self._connecting = False
+                self._ws = None
+                logger.error("RosbridgeClient connection error (%s)", type(e).__name__)
                 
             # Notify safety manager of disconnect (Requirement 7.5)
             await safety_manager.on_ws_disconnect(self.robot_id)
@@ -110,7 +147,7 @@ class RosbridgeClient:
             try:
                 await handler(msg)
             except Exception as e:
-                logger.exception("RosbridgeClient: handler error for message")
+                logger.error("RosbridgeClient: handler failed (%s)", type(e).__name__)
                 
     def start(self) -> None:
         """Start the client as a background task."""
@@ -120,3 +157,16 @@ class RosbridgeClient:
         """Stop the client and cancel reconnects."""
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
+
+    async def stop_and_wait(self) -> None:
+        """Cancel the reconnect loop and wait until its WebSocket is closed."""
+        task = self._reconnect_task
+        was_connected = self._connected
+        self.stop()
+        if task and task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
+        self._connected = False
+        self._connecting = False
+        self._ws = None
+        if was_connected:
+            await safety_manager.on_ws_disconnect(self.robot_id)

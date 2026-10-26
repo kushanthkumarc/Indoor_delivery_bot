@@ -1,10 +1,8 @@
 """
-Startup helpers: idempotent DB-migration runner.
+Optional migration helper for explicit local/single-process use.
 
-Runs `alembic upgrade head` programmatically on application boot, so
-deploys (Render, Docker, etc.) do not need a separate release-phase
-command. Safe to call on every cold start — Alembic is a no-op when the
-DB is already at the latest revision.
+Production migrations should run once as a controlled release step rather
+than from each application worker.
 
 We invoke the alembic CLI via subprocess rather than importing
 `alembic.command` directly. Reason: the project's local `./alembic/`
@@ -37,8 +35,8 @@ def upgrade_head() -> None:
     """
     Run `alembic upgrade head` synchronously via the alembic CLI binary.
 
-    Idempotent. Raises on failure — caller should treat that as fatal
-    because subsequent code will assume the schema is in sync.
+    Idempotent. Raises on failure; production callers should use a
+    controlled single migration runner, not concurrent web workers.
     """
     # Import inside the function so this module is import-safe even if
     # `app.db.session` has not finished initialising yet.
@@ -60,21 +58,20 @@ def upgrade_head() -> None:
     env = os.environ.copy()
     env["DATABASE_URL"] = clean_url
 
-    logger.info("Running %s in %s", cmd, _PROJECT_ROOT)
+    logger.info("Running schema migration command in %s", _PROJECT_ROOT)
     result = subprocess.run(
         cmd,
         cwd=_PROJECT_ROOT,
         env=env,
         capture_output=True,
         text=True,
+        timeout=300,
     )
     if result.returncode != 0:
-        logger.error("alembic upgrade FAILED:\n%s", result.stderr)
+        logger.error("Schema migration failed (exit code %s); command output suppressed", result.returncode)
         raise RuntimeError(
-            f"alembic upgrade head failed (rc={result.returncode}): {result.stderr}"
+            f"alembic upgrade head failed (rc={result.returncode})"
         )
-    if result.stdout:
-        logger.info("alembic output: %s", result.stdout.strip())
     logger.info("alembic upgrade head complete.")
 
 

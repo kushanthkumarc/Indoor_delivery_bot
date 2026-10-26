@@ -126,6 +126,11 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
+async def close_database() -> None:
+    """Dispose the SQLAlchemy pool during application shutdown."""
+    await engine.dispose()
+
+
 class Base(DeclarativeBase):
     pass
 

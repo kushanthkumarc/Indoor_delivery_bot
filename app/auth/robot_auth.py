@@ -14,6 +14,29 @@ from app.db.models import Robot
 from app.db.session import AsyncSession, get_db
 from sqlalchemy import select
 
+
+async def authenticate_robot_credentials(
+    robot_id: str,
+    api_key: str | None,
+    db: AsyncSession,
+) -> Robot | None:
+    """Authenticate a key against one explicitly identified robot.
+
+    Returns None for a missing/invalid key or unknown ID. Never logs secrets.
+    """
+    if not robot_id or len(robot_id) > 64 or not api_key or len(api_key) > 1024:
+        return None
+    result = await db.execute(select(Robot).where(Robot.id == robot_id))
+    robot = result.scalar_one_or_none()
+    if robot is None:
+        return None
+    try:
+        if bcrypt.checkpw(api_key.encode(), robot.api_key_hash.encode()):
+            return robot
+    except (ValueError, TypeError):
+        return None
+    return None
+
 _api_key_header = APIKeyHeader(name="X-Robot-API-Key", auto_error=False)
 
 

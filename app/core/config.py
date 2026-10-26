@@ -5,9 +5,11 @@ TLS-required Redis providers (Upstash, Aiven, Redis Cloud, Render KV).
 Local `redis://` (plaintext) connections are left untouched so that
 local Docker development still works.
 """
+import os
 from urllib.parse import urlparse
 
 from pydantic import AnyUrl, EmailStr, field_validator
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Cloud Redis providers that REQUIRE TLS. The right-hand side is the
@@ -69,6 +71,11 @@ class Settings(BaseSettings):
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    # Authentication throttling. Keep the secure production defaults; local
+    # demo environments may raise these values explicitly in .env.
+    AUTH_RATE_LIMIT_MAX_ATTEMPTS: int = 5
+    AUTH_RATE_LIMIT_WINDOW_S: int = 15 * 60
+
     # Robot authentication
     ROBOT_API_KEY: str = "change-me-robot-key"
 
@@ -76,21 +83,46 @@ class Settings(BaseSettings):
     ADMIN_EMAIL: EmailStr = "admin@example.com"
     ADMIN_PASSWORD: str = "change-me-admin-password"
 
-    # Simulation mode
-    SIMULATION_MODE: bool = False
-    SIM_NAV_DELAY_S: float = 5.0
-    SIM_NAV_SUCCESS_RATE: float = 0.9
-    SIM_SLAM_HZ: float = 10.0
-    SIM_PATH: str = "random_walk"  # "scripted" | "random_walk"
+    # ROS transport is opt-in; cloud services should leave it disabled.
+    ROSBRIDGE_ENABLED: bool = False
+    # Local operator-selected ROSBridge target. The admin connection endpoint
+    # may replace this in memory for the current process only.
+    ROSBRIDGE_URL: str = "ws://localhost:9090"
 
     # Application
+    APP_ENV: str = "development"
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8000
     DEBUG: bool = False
+    CORS_ORIGINS: str = ""
+    RUN_MIGRATIONS_ON_STARTUP: bool = False
 
     # Safety
     DELIVERY_STATE_TIMEOUT_S: int = 120
     HEARTBEAT_TIMEOUT_S: int = 5
+    # Mark telemetry stale before the heartbeat timeout takes the robot offline.
+    ROBOT_STALE_AFTER_S: int = 3
+    ROBOT_GATEWAY_MAX_MESSAGE_BYTES: int = 16_384
+    # Goal commands to the robot over its authenticated gateway socket. Off by default.
+    ROBOT_COMMAND_CHANNEL_ENABLED: bool = False
+    ROBOT_COMMAND_TTL_S: float = 15.0
+    ROBOT_COMMAND_ACK_TIMEOUT_S: float = 5.0
+
+    @model_validator(mode="after")
+    def validate_robot_freshness_thresholds(self) -> "Settings":
+        if self.HEARTBEAT_TIMEOUT_S <= 0:
+            raise ValueError("HEARTBEAT_TIMEOUT_S must be positive")
+        if not 0 < self.ROBOT_STALE_AFTER_S < self.HEARTBEAT_TIMEOUT_S:
+            raise ValueError("ROBOT_STALE_AFTER_S must be positive and less than HEARTBEAT_TIMEOUT_S")
+        return self
+
+    @model_validator(mode="after")
+    def validate_auth_rate_limit(self) -> "Settings":
+        if self.AUTH_RATE_LIMIT_MAX_ATTEMPTS < 1:
+            raise ValueError("AUTH_RATE_LIMIT_MAX_ATTEMPTS must be positive")
+        if self.AUTH_RATE_LIMIT_WINDOW_S < 1:
+            raise ValueError("AUTH_RATE_LIMIT_WINDOW_S must be positive")
+        return self
 
     @field_validator("REDIS_URL")
     @classmethod
@@ -99,3 +131,52 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def validate_production_settings() -> bool:
+    """Validate deployment-only invariants without printing configuration values.
+
+    Render exposes RENDER=true. APP_ENV=production enables the same checks in
+    other production environments. Returns whether production mode was found.
+    """
+    production = settings.APP_ENV.strip().lower() == "production" or os.getenv("RENDER", "").lower() == "true"
+    if not production:
+        return False
+
+    provided = set(settings.model_fields_set) | set(os.environ)
+    required = {"DATABASE_URL", "REDIS_URL", "JWT_SECRET"}
+    missing = sorted(required - provided)
+    errors = [f"missing required settings: {', '.join(missing)}"] if missing else []
+    if len(settings.JWT_SECRET) < 32 or settings.JWT_SECRET == "change-me-in-production":
+        errors.append("JWT_SECRET must be a non-default secret of at least 32 characters")
+    if settings.JWT_ALGORITHM != "HS256":
+        errors.append("JWT_ALGORITHM must be HS256 in production")
+    if not settings.DATABASE_URL.startswith("mysql+aiomysql://"):
+        errors.append("DATABASE_URL must use mysql+aiomysql in production")
+    else:
+        query = dict(
+            item.split("=", 1) for item in urlparse(settings.DATABASE_URL).query.split("&")
+            if "=" in item
+        )
+        ssl_mode = query.get("ssl-mode", query.get("ssl_mode", "")).upper()
+        if ssl_mode not in {"VERIFY_CA", "VERIFY_IDENTITY"}:
+            errors.append("DATABASE_URL must use ssl-mode=VERIFY_CA or VERIFY_IDENTITY")
+    if not settings.REDIS_URL.startswith("rediss://"):
+        errors.append("REDIS_URL must use TLS (rediss://) in production")
+    if settings.DEBUG:
+        errors.append("DEBUG must be false in production")
+    if settings.ROSBRIDGE_ENABLED:
+        errors.append("ROSBRIDGE_ENABLED must be false in production")
+    if settings.RUN_MIGRATIONS_ON_STARTUP:
+        errors.append("RUN_MIGRATIONS_ON_STARTUP must be false; use a single release migration step")
+    if "*" in [item.strip() for item in settings.CORS_ORIGINS.split(",") if item.strip()]:
+        errors.append("CORS_ORIGINS must not contain wildcard origins in production")
+    bootstrap_email = "ADMIN_EMAIL" in provided
+    bootstrap_password = "ADMIN_PASSWORD" in provided
+    if bootstrap_email != bootstrap_password:
+        errors.append("ADMIN_EMAIL and ADMIN_PASSWORD must be supplied together for first-admin provisioning")
+    if bootstrap_password and (len(settings.ADMIN_PASSWORD) < 14 or settings.ADMIN_PASSWORD == "change-me-admin-password"):
+        errors.append("ADMIN_PASSWORD must be a non-default password of at least 14 characters")
+    if errors:
+        raise RuntimeError("Unsafe production configuration: " + "; ".join(errors))
+    return True
