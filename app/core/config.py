@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     AUTH_RATE_LIMIT_MAX_ATTEMPTS: int = 5
     AUTH_RATE_LIMIT_WINDOW_S: int = 15 * 60
 
+    # Used only by the explicitly invoked demo seeding command.
+    DEMO_USER_PASSWORD: str = ""
+
     # Robot authentication
     ROBOT_API_KEY: str = "change-me-robot-key"
 
@@ -133,6 +136,10 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+class ProductionConfigurationError(RuntimeError):
+    """Contains only fixed validation messages and setting names, never values."""
+
+
 def validate_production_settings() -> bool:
     """Validate deployment-only invariants without printing configuration values.
 
@@ -178,5 +185,5 @@ def validate_production_settings() -> bool:
     if bootstrap_password and (len(settings.ADMIN_PASSWORD) < 14 or settings.ADMIN_PASSWORD == "change-me-admin-password"):
         errors.append("ADMIN_PASSWORD must be a non-default password of at least 14 characters")
     if errors:
-        raise RuntimeError("Unsafe production configuration: " + "; ".join(errors))
+        raise ProductionConfigurationError("Unsafe production configuration: " + "; ".join(errors))
     return True

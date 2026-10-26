@@ -15,7 +15,7 @@ from app.events.router import router as events_router
 from app.mapping.router import router as mapping_router
 from app.safety.router import router as safety_router
 from app.auth.service import hash_password
-from app.core.config import settings, validate_production_settings
+from app.core.config import settings, validate_production_settings, ProductionConfigurationError
 from app.db.models import User, UserRole
 from app.db.redis import close_redis, get_redis
 from app.db.session import AsyncSessionLocal, close_database
@@ -98,6 +98,10 @@ async def on_startup() -> None:
             logger.info("ROS bridge startup disabled; robot connectivity remains telemetry-driven")
         logger.info("Application startup completed")
     except Exception as exc:
+        if stage == "configuration validation" and isinstance(exc, ProductionConfigurationError):
+            # The validator emits setting names and fixed guidance only. Database
+            # and other runtime exceptions remain redacted below.
+            logger.error("%s", exc)
         logger.error("Application startup failed during %s (%s); service is not ready",
                      stage, type(exc).__name__)
         raise RuntimeError(f"Application startup failed during {stage}") from None

@@ -49,6 +49,61 @@ def test_production_configuration_accepts_tls_and_rejects_unsafe_settings(monkey
 
 
 @pytest.mark.asyncio
+async def test_startup_reports_configuration_guidance_without_secrets(monkeypatch, caplog):
+    monkeypatch.setattr(config_module, "settings", production_settings(
+        JWT_SECRET="short-secret-do-not-log", DATABASE_URL="mysql+aiomysql://u:hidden-db-password@db.example/robots?ssl-mode=REQUIRED"))
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(RuntimeError, match="configuration validation"):
+        await main_module.on_startup()
+    assert "JWT_SECRET must be" in caplog.text
+    assert "VERIFY_CA or VERIFY_IDENTITY" in caplog.text
+    assert "short-secret-do-not-log" not in caplog.text
+    assert "hidden-db-password" not in caplog.text
+
+
+def test_staging_seed_requires_opt_in_and_unique_password(monkeypatch):
+    from scripts import seed_video_demo as seed
+    monkeypatch.setattr(seed, "settings", SimpleNamespace(APP_ENV="production", DEMO_USER_PASSWORD="unique-demo-password-123"))
+    with pytest.raises(RuntimeError, match="production is forbidden"):
+        seed.seed_password(allow_staging=True)
+    monkeypatch.setattr(seed, "settings", SimpleNamespace(APP_ENV="staging", DEMO_USER_PASSWORD=""))
+    with pytest.raises(RuntimeError, match="--allow-staging"):
+        seed.seed_password()
+    monkeypatch.setattr(seed, "validate_production_settings", lambda: True)
+    with pytest.raises(RuntimeError, match="unique DEMO_USER_PASSWORD"):
+        seed.seed_password(allow_staging=True)
+    monkeypatch.setattr(seed, "settings", SimpleNamespace(APP_ENV="staging", DEMO_USER_PASSWORD="VideoDemo-2026!"))
+    with pytest.raises(RuntimeError, match="unique DEMO_USER_PASSWORD"):
+        seed.seed_password(allow_staging=True)
+    monkeypatch.setattr(seed, "settings", SimpleNamespace(APP_ENV="staging", DEMO_USER_PASSWORD="unique-demo-password-123"))
+    assert seed.seed_password(allow_staging=True) == "unique-demo-password-123"
+
+
+def test_render_cannot_seed_using_local_default_password(monkeypatch):
+    from scripts import seed_video_demo as seed
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.setattr(seed, "settings", SimpleNamespace(APP_ENV="development", DEMO_USER_PASSWORD=""))
+    with pytest.raises(RuntimeError, match="APP_ENV=staging"):
+        seed.seed_password()
+
+
+def test_deployment_checker_redacts_invalid_environment_values(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    project = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(project)
+    environment["DEBUG"] = "invalid-boolean-do-not-print-this"
+    result = subprocess.run([sys.executable, "-m", "scripts.check_deployment"], cwd=tmp_path,
+                            env=environment, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 1
+    assert "DEBUG" in result.stdout
+    assert "invalid-boolean-do-not-print-this" not in result.stdout + result.stderr
+
+
+@pytest.mark.asyncio
 async def test_public_registration_always_creates_user():
     class Result:
         def scalar_one_or_none(self): return None

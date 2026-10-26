@@ -1,10 +1,13 @@
-"""Add repeatable, clearly labelled fixtures to the local development database.
+"""Add repeatable, labelled fixtures to development or explicitly opted-in staging.
 
 Run inside the app container. Existing accounts and hardware records are preserved.
+Staging requires --allow-staging and a unique DEMO_USER_PASSWORD; production is forbidden.
 This creates historical samples, not a navigation transport or physical telemetry.
 """
 import asyncio
+import argparse
 import json
+import os
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -12,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 
 from app.auth.service import hash_password
-from app.core.config import settings
+from app.core.config import settings, validate_production_settings
 from app.db.models import (
     Delivery, DeliveryStatus, Destination, Event, EventSeverity, MappingSession,
     MappingSessionStatus, Robot, RobotStatus, ControlMode, User, UserRobotAccess,
@@ -25,20 +28,38 @@ def key(label):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "robot-operator-video-demo/" + label))
 
 
-async def main():
-    if settings.APP_ENV != "development":
-        raise RuntimeError("Demo fixtures are restricted to APP_ENV=development")
+def seed_password(allow_staging=False):
+    environment = settings.APP_ENV.strip().lower()
+    if environment == "development":
+        if os.getenv("RENDER", "").lower() == "true":
+            raise RuntimeError("Render demo seeding requires APP_ENV=staging and --allow-staging")
+        return settings.DEMO_USER_PASSWORD or "VideoDemo-2026!"
+    if environment != "staging" or not allow_staging:
+        raise RuntimeError("Demo fixtures require development or staging with --allow-staging; production is forbidden")
+    # Render still enforces verified TLS and strong application credentials even
+    # when APP_ENV=staging. Never turn those checks off for a demonstration.
+    validate_production_settings()
+    password = settings.DEMO_USER_PASSWORD
+    if len(password) < 14 or password in {"VideoDemo-2026!", "change-me-admin-password"}:
+        raise RuntimeError("Set a unique DEMO_USER_PASSWORD of at least 14 characters before staging seeding")
+    return password
+
+
+async def main(allow_staging=False):
+    password = seed_password(allow_staging)
     now = datetime.now(timezone.utc)
     async with AsyncSessionLocal() as db:
-        admin = (await db.execute(select(User).where(User.role == UserRole.ADMIN))).scalars().first()
+        admin = (await db.execute(select(User).where(User.role == UserRole.ADMIN, User.is_active.is_(True)))).scalars().first()
         if admin is None:
             raise RuntimeError("Create an admin before seeding")
         demo = (await db.execute(select(User).where(User.email == "video.demo@example.com"))).scalar_one_or_none()
         if demo is None:
             demo = User(email="video.demo@example.com", name="Video Demo Operator", role=UserRole.USER,
-                        is_active=True, password_hash=hash_password("VideoDemo-2026!"))
+                        is_active=True, password_hash=hash_password(password))
             db.add(demo)
             await db.flush()
+        elif demo.role != UserRole.USER or not demo.is_active:
+            raise RuntimeError("The demo email already belongs to an inactive or non-USER account; no changes applied")
         robot = await db.get(Robot, key("robot"))
         if robot is None:
             robot = Robot(id=key("robot"), name="DEMO - Campus Courier 01",
@@ -63,7 +84,10 @@ async def main():
                 db.add(Destination(id=key(name), name="DEMO - " + name, map_id=mapping.id,
                                    x=x, y=y, theta=theta, is_home=name == "Reception"))
         await db.flush()
-        users = (await db.execute(select(User).where(User.role == UserRole.USER, User.is_active.is_(True)))).scalars().all()
+        user_query = select(User).where(User.role == UserRole.USER, User.is_active.is_(True))
+        if settings.APP_ENV.strip().lower() != "development":
+            user_query = user_query.where(User.id == demo.id)
+        users = (await db.execute(user_query)).scalars().all()
         for user in users:
             grant = (await db.execute(select(UserRobotAccess).where(
                 UserRobotAccess.user_id == user.id, UserRobotAccess.robot_id == robot.id))).scalar_one_or_none()
@@ -103,4 +127,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allow-staging", action="store_true", help="Explicitly seed the dedicated demo account on a staging database")
+    args = parser.parse_args()
+    asyncio.run(main(allow_staging=args.allow_staging))

@@ -30,6 +30,8 @@ MANIFEST
 .env
 .env.production
 .env.local
+.env.*
+!.env.example
 
 # Virtual environments
 venv/
